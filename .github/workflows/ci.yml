@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - run: go build ./...
+      - run: go vet ./...
+      # -race is not optional here: BufferedPipe and the poll/flush loops are
+      # the whole point of this library, and every one of their bugs is a race.
+      - run: go test -race ./...
