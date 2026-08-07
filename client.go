@@ -100,6 +100,11 @@ type Connector struct {
 	// server in X-Local-Health. It lets the server distinguish "the tunnel is
 	// up" from "the tunnel is up but the service behind it is down".
 	LocalHealth func() bool
+	// PreferStream asks the server to negotiate PollModeStream. Ignored by a
+	// server not configured for it — Connect falls back to the ordinary
+	// batch poll loop with no error and no visible difference to the caller
+	// beyond throughput.
+	PreferStream bool
 	// Logger receives transport diagnostics. Nil disables logging.
 	Logger *slog.Logger
 }
@@ -151,6 +156,19 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 		return nil, err
 	}
 
+	negotiatedMode := PollModeBatch
+	if cr.PollMode == PollModeStream {
+		negotiatedMode = PollModeStream
+		if cr.Limits.HeartbeatIntervalMS <= 0 {
+			return nil, fmt.Errorf("pollmux: server negotiated stream mode but sent non-positive heartbeat_interval_ms=%d",
+				cr.Limits.HeartbeatIntervalMS)
+		}
+		if cr.Limits.StreamMaxDurationMS <= 0 {
+			return nil, fmt.Errorf("pollmux: server negotiated stream mode but sent non-positive stream_max_duration_ms=%d",
+				cr.Limits.StreamMaxDurationMS)
+		}
+	}
+
 	// Startup self-check. A poll cycle longer than the server's session timeout
 	// means a perfectly healthy client gets swept as dead, so fail loudly at
 	// startup rather than reconnect-looping in production.
@@ -174,7 +192,17 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 	// Two clients, deliberately not shared. The poll client must tolerate a
 	// response header withheld for the whole long-poll timeout; the send client
 	// must not, or a stalled send would sit undetected for that same span.
-	pollTransport := c.newTransport(dialTimeout, cr.Limits.PollTimeout()+pollGrace)
+	//
+	// Stream mode's response headers come back almost immediately (see
+	// pollStream's immediate flush) — the long wait moves inside the body —
+	// so its ResponseHeaderTimeout only needs to cover connection setup, not
+	// a long-poll wait, unlike batch's PollTimeout()+pollGrace.
+	var pollTransport *http.Transport
+	if negotiatedMode == PollModeStream {
+		pollTransport = c.newTransport(dialTimeout, pollGrace)
+	} else {
+		pollTransport = c.newTransport(dialTimeout, cr.Limits.PollTimeout()+pollGrace)
+	}
 	sendTransport := c.newTransport(dialTimeout, sendTimeout)
 
 	connCtx, cancel := context.WithCancel(context.Background())
@@ -196,6 +224,10 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 		transportFailed: make(chan struct{}),
 		ctx:             connCtx,
 		cancel:          cancel,
+
+		streamMode:        negotiatedMode == PollModeStream,
+		streamIdleTimeout: cr.Limits.HeartbeatInterval() + pollGrace,
+		streamMaxFrame:    orInt(cr.Limits.PollBufferBytes, DefaultPollBufferSize),
 	}
 
 	logger.Debug("pollmux: connected",
@@ -203,10 +235,15 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 		"poll_timeout", cr.Limits.PollTimeout(),
 		"session_timeout", cr.Limits.SessionTimeout(),
 		"poll_buffer_bytes", cr.Limits.PollBufferBytes,
+		"poll_mode", negotiatedMode,
 	)
 
 	conn.wg.Add(1)
-	go conn.pollLoop()
+	if conn.streamMode {
+		go conn.pollLoopStream()
+	} else {
+		go conn.pollLoop()
+	}
 
 	return conn, nil
 }
@@ -233,8 +270,9 @@ func (c *Connector) newTransport(dialTimeout, responseHeaderTimeout time.Duratio
 // doConnect performs POST {prefix}/connect and parses the response.
 func (c *Connector) doConnect(ctx context.Context, client *http.Client, base string) (*ConnectResponse, error) {
 	body, err := json.Marshal(ConnectRequest{
-		ProtocolVersion: ProtocolVersion,
-		Meta:            c.Meta,
+		ProtocolVersion:  ProtocolVersion,
+		Meta:             c.Meta,
+		PreferStreamMode: c.PreferStream,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pollmux: failed to encode connect request: %w", err)
@@ -316,6 +354,14 @@ type httpConn struct {
 	logger         *slog.Logger
 
 	readPipe *BufferedPipe
+
+	// streamMode, streamIdleTimeout, and streamMaxFrame are only meaningful
+	// when streamMode is true: streamIdleTimeout is HeartbeatInterval+
+	// PollGrace, the read-idle watchdog's timeout, and streamMaxFrame caps a
+	// single decoded data frame's payload (from Limits.PollBufferBytes).
+	streamMode        bool
+	streamIdleTimeout time.Duration
+	streamMaxFrame    int
 
 	transportFailed chan struct{}
 	failOnce        sync.Once
@@ -525,6 +571,118 @@ func (c *httpConn) doPoll(readCap int64) (bool, error) {
 	}
 }
 
+// errStreamEnd is doStreamPoll's sentinel for a clean end of one stream-mode
+// poll response — an explicit frameEnd, or the body closing exactly at a
+// frame boundary (see frameReader.next). pollLoopStream treats it as "open
+// the next stream poll immediately", the same spirit as pollLoop re-polling
+// right after data arrives.
+var errStreamEnd = errors.New("pollmux: stream poll ended cleanly")
+
+// pollLoopStream is pollLoop's stream-mode counterpart: it holds one
+// long-lived poll response open at a time and decodes frames from it as they
+// arrive, instead of one discrete request per buffer. It is a separate loop
+// rather than a shared one with pollLoop because the two have different
+// failure semantics end to end (idle watchdog vs. ResponseHeaderTimeout,
+// frameEnd vs. 204) — folding them together would hide that difference
+// behind a flag instead of making it visible in the code.
+func (c *httpConn) pollLoopStream() {
+	defer c.wg.Done()
+	for {
+		if c.ctx.Err() != nil {
+			return
+		}
+
+		err := c.doStreamPoll()
+		if errors.Is(err, errStreamEnd) {
+			continue // clean end: reopen a new stream poll right away
+		}
+		if c.ctx.Err() != nil || c.closed.Load() {
+			return // deliberate shutdown, not a failure
+		}
+		c.logger.Warn("pollmux: stream poll failed, signalling transport failure", "error", err)
+		c.fail()
+		return
+	}
+}
+
+// doStreamPoll issues one stream-mode long poll and decodes frames from the
+// response body as they arrive, writing each data frame's payload into the
+// read pipe as soon as it is decoded — it never waits for the response to
+// end. It always returns a non-nil error: errStreamEnd for a clean end,
+// anything else for a real transport problem.
+func (c *httpConn) doStreamPoll() error {
+	reqCtx, cancelReq := context.WithCancel(c.ctx)
+	defer cancelReq()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.pollURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set(HeaderReceiveOnly, "true")
+	c.setAuth(req)
+	if c.localHealth != nil {
+		if c.localHealth() {
+			req.Header.Set(HeaderLocalHealth, "ok")
+		} else {
+			req.Header.Set(HeaderLocalHealth, "down")
+		}
+	}
+
+	resp, err := c.pollClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// fall through to frame decoding
+	case http.StatusGone:
+		return &fatalPollError{status: resp.StatusCode, detail: "session closed by server"}
+	default:
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
+		return &fatalPollError{status: resp.StatusCode, detail: strings.TrimSpace(string(detail))}
+	}
+
+	// Idle watchdog: any frame, data or heartbeat, resets it. Nothing for
+	// HeartbeatInterval+grace means the link is stuck even though the
+	// response header already came back fine — cancelReq aborts just this
+	// request's body read, and pollLoopStream reopens a fresh stream right
+	// after (reported as a failure below via the reqCtx.Err() check).
+	watchdog := time.AfterFunc(c.streamIdleTimeout, cancelReq)
+	defer watchdog.Stop()
+
+	fr := newFrameReader(resp.Body, c.streamMaxFrame)
+	for {
+		typ, payload, err := fr.next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return errStreamEnd // body closed cleanly at a frame boundary
+			}
+			if reqCtx.Err() != nil && c.ctx.Err() == nil {
+				return fmt.Errorf("pollmux: stream idle watchdog fired after %v with no frame", c.streamIdleTimeout)
+			}
+			return fmt.Errorf("reading stream frame: %w", err)
+		}
+		watchdog.Reset(c.streamIdleTimeout)
+
+		switch typ {
+		case frameData:
+			if len(payload) > 0 {
+				if _, err := c.readPipe.Write(payload); err != nil {
+					return fmt.Errorf("read pipe closed: %w", err)
+				}
+			}
+		case frameHeartbeat:
+			// nothing to do beyond the watchdog reset above
+		case frameEnd:
+			return errStreamEnd
+		default:
+			return fmt.Errorf("pollmux: unknown stream frame type %#x", typ)
+		}
+	}
+}
+
 // flushLoop drains the write buffer until it is empty, splitting anything over
 // the negotiated chunk size across requests.
 //
@@ -618,6 +776,13 @@ func noRedirect(*http.Request, []*http.Request) error {
 }
 
 func orDuration(v, fallback time.Duration) time.Duration {
+	if v <= 0 {
+		return fallback
+	}
+	return v
+}
+
+func orInt(v, fallback int) int {
 	if v <= 0 {
 		return fallback
 	}

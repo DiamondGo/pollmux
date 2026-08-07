@@ -32,6 +32,13 @@ type Session struct {
 
 	meta map[string]string
 
+	// pollMode is the mode negotiated for this session at connect time:
+	// PollModeBatch or PollModeStream. Set once by ConnectHandler before the
+	// session is published via SessionStore.add, and never mutated after —
+	// so PollHandler can read it with no lock, the same way it already
+	// treats meta as effectively immutable post-construction.
+	pollMode string
+
 	// pollInFlight counts long polls currently parked in the handler. A value
 	// above zero means a TCP connection is being held open by this client right
 	// now, so the session is demonstrably alive and must not be evicted — and

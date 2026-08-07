@@ -51,6 +51,12 @@ type miniBroker struct {
 }
 
 func newMiniBroker(t *testing.T, token string, tls bool) *miniBroker {
+	return newMiniBrokerWithMode(t, token, tls, "")
+}
+
+// newMiniBrokerWithMode is newMiniBroker's poll-mode-aware counterpart, used
+// by the two topology tests parameterized over batch/stream.
+func newMiniBrokerWithMode(t *testing.T, token string, tls bool, mode string) *miniBroker {
 	t.Helper()
 
 	b := &miniBroker{
@@ -65,6 +71,7 @@ func newMiniBroker(t *testing.T, token string, tls bool) *miniBroker {
 			CoalesceWindow: 2 * time.Millisecond,
 			PollBufferSize: 256 << 10,
 			MaxSendBytes:   256 << 10,
+			PollMode:       mode,
 			// An application on gorilla/mux never gets the id from
 			// PathValue. Extract it the way mux.Vars would.
 			SessionIDFunc: func(r *http.Request) string {
@@ -75,6 +82,10 @@ func newMiniBroker(t *testing.T, token string, tls bool) *miniBroker {
 				return parts[1]
 			},
 		},
+	}
+	if mode == PollModeStream {
+		b.cfg.HeartbeatInterval = 100 * time.Millisecond
+		b.cfg.StreamMaxDuration = 400 * time.Millisecond
 	}
 
 	b.hooks = Hooks{
@@ -307,6 +318,11 @@ type miniProvider struct {
 }
 
 func runMiniProvider(t *testing.T, ctx context.Context, brokerURL, token, endpoint string, insecure bool) *miniProvider {
+	return runMiniProviderMode(t, ctx, brokerURL, token, endpoint, insecure, false)
+}
+
+// runMiniProviderMode is runMiniProvider's poll-mode-aware counterpart.
+func runMiniProviderMode(t *testing.T, ctx context.Context, brokerURL, token, endpoint string, insecure, preferStream bool) *miniProvider {
 	t.Helper()
 	p := &miniProvider{
 		outcomes: make(chan Outcome, 8),
@@ -321,6 +337,7 @@ func runMiniProvider(t *testing.T, ctx context.Context, brokerURL, token, endpoi
 				Meta:               map[string]string{"role": "provider", "endpoint": endpoint},
 				PollGrace:          2 * time.Second,
 				InsecureSkipVerify: insecure,
+				PreferStream:       preferStream,
 			}
 			return c.Connect(ctx)
 		},
@@ -382,6 +399,11 @@ type miniConsumer struct {
 }
 
 func runMiniConsumer(t *testing.T, ctx context.Context, brokerURL, token, endpoint string, insecure bool) *miniConsumer {
+	return runMiniConsumerMode(t, ctx, brokerURL, token, endpoint, insecure, false)
+}
+
+// runMiniConsumerMode is runMiniConsumer's poll-mode-aware counterpart.
+func runMiniConsumerMode(t *testing.T, ctx context.Context, brokerURL, token, endpoint string, insecure, preferStream bool) *miniConsumer {
 	t.Helper()
 	c := &miniConsumer{
 		outcomes: make(chan Outcome, 8),
@@ -397,6 +419,7 @@ func runMiniConsumer(t *testing.T, ctx context.Context, brokerURL, token, endpoi
 				Meta:               map[string]string{"role": "consumer", "endpoint": endpoint},
 				PollGrace:          2 * time.Second,
 				InsecureSkipVerify: insecure,
+				PreferStream:       preferStream,
 			}
 			return conn.Connect(ctx)
 		},
@@ -531,16 +554,19 @@ func echoTarget(t *testing.T) string {
 
 // The whole topology: bytes travel consumer → broker → provider → target and
 // back, over two independent pollmux tunnels with yamux on each.
-func TestBrokerTopologyEndToEnd(t *testing.T) {
+func TestBrokerTopologyEndToEnd(t *testing.T)        { testBrokerTopologyEndToEnd(t, "") }
+func TestBrokerTopologyEndToEnd_Stream(t *testing.T) { testBrokerTopologyEndToEnd(t, PollModeStream) }
+
+func testBrokerTopologyEndToEnd(t *testing.T, mode string) {
 	const token = "broker-token"
 	target := echoTarget(t)
-	b := newMiniBroker(t, token, false)
+	b := newMiniBrokerWithMode(t, token, false, mode)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	runMiniProvider(t, ctx, b.ts.URL, token, "home", false)
-	c := runMiniConsumer(t, ctx, b.ts.URL, token, "home", false)
+	runMiniProviderMode(t, ctx, b.ts.URL, token, "home", false, mode == PollModeStream)
+	c := runMiniConsumerMode(t, ctx, b.ts.URL, token, "home", false, mode == PollModeStream)
 	c.waitReady(t)
 
 	stream := c.dial(t, target)
@@ -564,15 +590,22 @@ func TestBrokerTopologyEndToEnd(t *testing.T) {
 // Megabytes through the full three-role chain, hashed. This is the case that
 // exercises chunking, the poll buffer, and yamux flow control together.
 func TestBrokerTopologyBulkTransfer(t *testing.T) {
+	testBrokerTopologyBulkTransfer(t, "")
+}
+func TestBrokerTopologyBulkTransfer_Stream(t *testing.T) {
+	testBrokerTopologyBulkTransfer(t, PollModeStream)
+}
+
+func testBrokerTopologyBulkTransfer(t *testing.T, mode string) {
 	const token = "broker-token"
 	target := echoTarget(t)
-	b := newMiniBroker(t, token, false)
+	b := newMiniBrokerWithMode(t, token, false, mode)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	runMiniProvider(t, ctx, b.ts.URL, token, "home", false)
-	c := runMiniConsumer(t, ctx, b.ts.URL, token, "home", false)
+	runMiniProviderMode(t, ctx, b.ts.URL, token, "home", false, mode == PollModeStream)
+	c := runMiniConsumerMode(t, ctx, b.ts.URL, token, "home", false, mode == PollModeStream)
 	c.waitReady(t)
 
 	stream := c.dial(t, target)

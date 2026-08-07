@@ -24,14 +24,28 @@ type e2e struct {
 	cfg   ServerConfig
 	hooks Hooks
 
+	// pollMode is "" (batch) or PollModeStream. dial() reads it to decide
+	// whether the client asks for stream mode.
+	pollMode string
+
 	mu           sync.Mutex
 	disconnects  []DisconnectReason
 	serverStream func(net.Conn)
 }
 
-// newE2E builds the server side. handle runs for each yamux stream the client
-// opens; nil means echo.
+// newE2E builds the server side in batch mode. handle runs for each yamux
+// stream the client opens; nil means echo.
 func newE2E(t *testing.T, handle func(net.Conn)) *e2e {
+	return newE2EWithMode(t, handle, "")
+}
+
+// newE2EStream is newE2E's stream-mode counterpart: same topology, same
+// helper methods, negotiated stream instead of batch.
+func newE2EStream(t *testing.T, handle func(net.Conn)) *e2e {
+	return newE2EWithMode(t, handle, PollModeStream)
+}
+
+func newE2EWithMode(t *testing.T, handle func(net.Conn), mode string) *e2e {
 	t.Helper()
 
 	if handle == nil {
@@ -44,6 +58,7 @@ func newE2E(t *testing.T, handle func(net.Conn)) *e2e {
 	e := &e2e{
 		store:        NewSessionStore(),
 		serverStream: handle,
+		pollMode:     mode,
 		cfg: ServerConfig{
 			PollTimeout:    500 * time.Millisecond,
 			SessionTimeout: time.Second,
@@ -51,7 +66,12 @@ func newE2E(t *testing.T, handle func(net.Conn)) *e2e {
 			CoalesceWindow: 2 * time.Millisecond,
 			PollBufferSize: 256 << 10,
 			MaxSendBytes:   256 << 10,
+			PollMode:       mode,
 		},
+	}
+	if mode == PollModeStream {
+		e.cfg.HeartbeatInterval = 200 * time.Millisecond
+		e.cfg.StreamMaxDuration = 2 * time.Second
 	}
 
 	e.hooks = Hooks{
@@ -94,7 +114,7 @@ func newE2E(t *testing.T, handle func(net.Conn)) *e2e {
 // dial brings up a client conn plus its yamux session.
 func (e *e2e) dial(t *testing.T) (Conn, *yamux.Session) {
 	t.Helper()
-	c := &Connector{BaseURL: e.ts.URL, PollGrace: 2 * time.Second}
+	c := &Connector{BaseURL: e.ts.URL, PollGrace: 2 * time.Second, PreferStream: e.pollMode == PollModeStream}
 	conn, err := c.Connect(context.Background())
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
@@ -121,8 +141,10 @@ func (e *e2e) reasons() []DisconnectReason {
 
 // Megabytes through the whole stack, compared by hash. Everything else in this
 // library is in service of this working.
-func TestE2EByteFidelity(t *testing.T) {
-	e := newE2E(t, nil)
+func TestE2EByteFidelity(t *testing.T)        { testE2EByteFidelity(t, newE2E(t, nil)) }
+func TestE2EByteFidelity_Stream(t *testing.T) { testE2EByteFidelity(t, newE2EStream(t, nil)) }
+
+func testE2EByteFidelity(t *testing.T, e *e2e) {
 	_, sess := e.dial(t)
 
 	payload := make([]byte, 2<<20)
@@ -170,10 +192,17 @@ func TestE2EByteFidelity(t *testing.T) {
 // cannot head-of-line block the other. If they were serialized, N slow streams
 // would take N times as long as one.
 func TestE2EConcurrentStreamsAreNotSerialized(t *testing.T) {
+	testE2EConcurrentStreamsAreNotSerialized(t, func(handle func(net.Conn)) *e2e { return newE2E(t, handle) })
+}
+func TestE2EConcurrentStreamsAreNotSerialized_Stream(t *testing.T) {
+	testE2EConcurrentStreamsAreNotSerialized(t, func(handle func(net.Conn)) *e2e { return newE2EStream(t, handle) })
+}
+
+func testE2EConcurrentStreamsAreNotSerialized(t *testing.T, build func(func(net.Conn)) *e2e) {
 	const streamDelay = 200 * time.Millisecond
 	const streams = 8
 
-	e := newE2E(t, func(stream net.Conn) {
+	e := build(func(stream net.Conn) {
 		defer stream.Close()
 		buf := make([]byte, 16)
 		n, err := stream.Read(buf)
@@ -223,7 +252,14 @@ func TestE2EConcurrentStreamsAreNotSerialized(t *testing.T) {
 }
 
 func TestE2EBidirectionalTraffic(t *testing.T) {
-	e := newE2E(t, func(stream net.Conn) {
+	testE2EBidirectionalTraffic(t, func(handle func(net.Conn)) *e2e { return newE2E(t, handle) })
+}
+func TestE2EBidirectionalTraffic_Stream(t *testing.T) {
+	testE2EBidirectionalTraffic(t, func(handle func(net.Conn)) *e2e { return newE2EStream(t, handle) })
+}
+
+func testE2EBidirectionalTraffic(t *testing.T, build func(func(net.Conn)) *e2e) {
+	e := build(func(stream net.Conn) {
 		defer stream.Close()
 		buf := make([]byte, 64)
 		n, err := stream.Read(buf)
@@ -259,7 +295,13 @@ func TestE2EBidirectionalTraffic(t *testing.T) {
 // in seconds — not by waiting for its own timeout, which is what sharing 204
 // with the idle heartbeat used to cause.
 func TestE2EServerCloseIsNoticedPromptly(t *testing.T) {
-	e := newE2E(t, nil)
+	testE2EServerCloseIsNoticedPromptly(t, newE2E(t, nil))
+}
+func TestE2EServerCloseIsNoticedPromptly_Stream(t *testing.T) {
+	testE2EServerCloseIsNoticedPromptly(t, newE2EStream(t, nil))
+}
+
+func testE2EServerCloseIsNoticedPromptly(t *testing.T, e *e2e) {
 	conn, _ := e.dial(t)
 
 	// Let the poll loop park before pulling the session out from under it.
@@ -291,6 +333,9 @@ func TestE2EServerCloseIsNoticedPromptly(t *testing.T) {
 
 // Graceful shutdown: close everything in the store and every application gets
 // told once, with a reason it can distinguish from an eviction.
+//
+// Batch-only: this exercises store/sweeper mechanics that do not depend on
+// poll mode.
 func TestE2EGracefulShutdownClosesEverySession(t *testing.T) {
 	e := newE2E(t, nil)
 
@@ -333,6 +378,8 @@ func TestE2EGracefulShutdownClosesEverySession(t *testing.T) {
 
 // A client that goes away without a DELETE — killed, network cut — must be
 // swept, and the application told, within roughly one session timeout.
+//
+// Batch-only: sweeper mechanics do not depend on poll mode.
 func TestE2EAbandonedSessionIsSwept(t *testing.T) {
 	e := newE2E(t, nil)
 	conn, _ := e.dial(t)
@@ -360,9 +407,14 @@ func TestE2EAbandonedSessionIsSwept(t *testing.T) {
 // A clean client exit removes the session immediately rather than leaving it
 // for the sweeper.
 func TestE2ECleanDisconnect(t *testing.T) {
-	e := newE2E(t, nil)
+	testE2ECleanDisconnect(t, newE2E(t, nil))
+}
+func TestE2ECleanDisconnect_Stream(t *testing.T) {
+	testE2ECleanDisconnect(t, newE2EStream(t, nil))
+}
 
-	c := &Connector{BaseURL: e.ts.URL, PollGrace: 2 * time.Second}
+func testE2ECleanDisconnect(t *testing.T, e *e2e) {
+	c := &Connector{BaseURL: e.ts.URL, PollGrace: 2 * time.Second, PreferStream: e.pollMode == PollModeStream}
 	conn, err := c.Connect(context.Background())
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
@@ -381,15 +433,20 @@ func TestE2ECleanDisconnect(t *testing.T) {
 // Reconnecting through the real stack, driven by ReconnectLoop: the server
 // closes a session and the loop brings a fresh one up on its own.
 func TestE2EReconnectLoopRecoversFromServerClose(t *testing.T) {
-	e := newE2E(t, nil)
+	testE2EReconnectLoopRecoversFromServerClose(t, newE2E(t, nil))
+}
+func TestE2EReconnectLoopRecoversFromServerClose_Stream(t *testing.T) {
+	testE2EReconnectLoopRecoversFromServerClose(t, newE2EStream(t, nil))
+}
 
+func testE2EReconnectLoopRecoversFromServerClose(t *testing.T, e *e2e) {
 	sessionIDs := make(chan string, 4)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	loop := &ReconnectLoop{
 		Connect: func(ctx context.Context) (Conn, error) {
-			c := &Connector{BaseURL: e.ts.URL, PollGrace: 2 * time.Second}
+			c := &Connector{BaseURL: e.ts.URL, PollGrace: 2 * time.Second, PreferStream: e.pollMode == PollModeStream}
 			return c.Connect(ctx)
 		},
 		Serve: func(ctx context.Context, conn Conn) Outcome {

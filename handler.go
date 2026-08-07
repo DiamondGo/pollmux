@@ -13,10 +13,16 @@ import (
 	"time"
 )
 
-// PollModeBatch is the only poll mode implemented: discrete send requests plus
-// batched poll responses. The field exists so that streaming can be added later
-// without changing the shape of ServerConfig.
+// PollModeBatch is the discrete-request poll mode: one send request in, one
+// batched poll response out. Simple, but the downstream ceiling is one
+// poll_buffer_bytes per round trip.
 const PollModeBatch = "batch"
+
+// PollModeStream is the low-latency downstream mode: PollHandler holds the
+// long-poll response open and pushes framed chunks as they arrive instead of
+// waiting for one ReadAvailable call and returning. See frame.go for the wire
+// format inside the response body.
+const PollModeStream = "stream"
 
 // ServerConfig holds the server's half of the transport parameters. Every
 // zero-valued field falls back to its documented default.
@@ -54,8 +60,23 @@ type ServerConfig struct {
 	// deployment runs to the window × max_streams worst case.
 	HighWaterWarn int
 
-	// PollMode must be empty or PollModeBatch. Reserved for streaming.
+	// PollMode must be "", PollModeBatch, or PollModeStream. "" behaves
+	// exactly like PollModeBatch.
 	PollMode string
+
+	// HeartbeatInterval is how long PollModeStream lets a poll go idle before
+	// sending a heartbeat frame — the same role PollTimeout plays in batch
+	// mode, reused as ReadAvailable's timeout argument. Ignored outside
+	// stream mode.
+	HeartbeatInterval time.Duration
+
+	// StreamMaxDuration caps how long one stream-mode poll response may stay
+	// open before the server ends it cleanly and the client reopens a new
+	// one. This exists to stay under intermediate proxies' idle/read
+	// timeouts, not for flow control — keep it comfortably below the
+	// tightest timeout in your deployment's path (see README). Ignored
+	// outside stream mode.
+	StreamMaxDuration time.Duration
 
 	// Logger receives diagnostics. Nil disables logging.
 	Logger *slog.Logger
@@ -80,6 +101,12 @@ func (cfg ServerConfig) withDefaults() ServerConfig {
 	if cfg.MaxSendBytes <= 0 {
 		cfg.MaxSendBytes = DefaultMaxSendBytes
 	}
+	if cfg.HeartbeatInterval <= 0 {
+		cfg.HeartbeatInterval = DefaultHeartbeatInterval
+	}
+	if cfg.StreamMaxDuration <= 0 {
+		cfg.StreamMaxDuration = DefaultStreamMaxDuration
+	}
 	if cfg.SessionIDFunc == nil {
 		cfg.SessionIDFunc = func(r *http.Request) string { return r.PathValue("id") }
 	}
@@ -91,24 +118,54 @@ func (cfg ServerConfig) withDefaults() ServerConfig {
 
 // check reports wiring mistakes that no runtime behaviour can paper over.
 func (cfg ServerConfig) check() {
-	if cfg.PollMode != "" && cfg.PollMode != PollModeBatch {
-		panic(fmt.Sprintf("pollmux: ServerConfig.PollMode = %q, only %q is implemented", cfg.PollMode, PollModeBatch))
+	switch cfg.PollMode {
+	case "", PollModeBatch, PollModeStream:
+	default:
+		panic(fmt.Sprintf("pollmux: ServerConfig.PollMode = %q, only %q and %q are implemented",
+			cfg.PollMode, PollModeBatch, PollModeStream))
 	}
 	if cfg.SessionTimeout > 0 && cfg.PollTimeout > 0 && cfg.SessionTimeout < 2*cfg.PollTimeout {
 		panic(fmt.Sprintf("pollmux: ServerConfig.SessionTimeout=%v is below 2×PollTimeout=%v; "+
 			"a healthy client that is merely between polls would be swept as dead",
 			cfg.SessionTimeout, 2*cfg.PollTimeout))
 	}
+	// Same "fail at wiring time" spirit as the check above, for the
+	// stream-mode equivalent knobs: a StreamMaxDuration too close to
+	// HeartbeatInterval would force the stream to end almost as soon as it
+	// opens.
+	if cfg.PollMode == PollModeStream && cfg.StreamMaxDuration > 0 && cfg.HeartbeatInterval > 0 &&
+		cfg.StreamMaxDuration < 2*cfg.HeartbeatInterval {
+		panic(fmt.Sprintf("pollmux: ServerConfig.StreamMaxDuration=%v is below 2×HeartbeatInterval=%v; "+
+			"the stream would barely open before being forced to end",
+			cfg.StreamMaxDuration, 2*cfg.HeartbeatInterval))
+	}
 }
 
-// limits is what gets handed down to clients at connect time.
-func (cfg ServerConfig) limits() Limits {
-	return Limits{
+// limits is what gets handed down to clients at connect time for the given
+// negotiated mode.
+func (cfg ServerConfig) limits(mode string) Limits {
+	l := Limits{
 		MaxSendBytes:     cfg.MaxSendBytes,
 		PollTimeoutMS:    cfg.PollTimeout.Milliseconds(),
 		SessionTimeoutMS: cfg.SessionTimeout.Milliseconds(),
 		PollBufferBytes:  cfg.PollBufferSize,
 	}
+	if mode == PollModeStream {
+		l.HeartbeatIntervalMS = cfg.HeartbeatInterval.Milliseconds()
+		l.StreamMaxDurationMS = cfg.StreamMaxDuration.Milliseconds()
+	}
+	return l
+}
+
+// negotiatePollMode decides the session's mode: stream only if the server is
+// configured for it AND the client asked for it. The server is always the
+// authority — a client that prefers stream against a batch-only server gets
+// batch, silently, which is what lets old and new binaries interoperate.
+func negotiatePollMode(serverMode string, clientPrefersStream bool) string {
+	if serverMode == PollModeStream && clientPrefersStream {
+		return PollModeStream
+	}
+	return PollModeBatch
 }
 
 // Hooks is where the application plugs its own logic in. Every field is
@@ -209,7 +266,10 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 			return
 		}
 
+		negotiatedMode := negotiatePollMode(cfg.PollMode, req.PreferStreamMode)
+
 		s := newSession(id, meta)
+		s.pollMode = negotiatedMode
 		s.watchHighWater(cfg.HighWaterWarn, cfg.Logger)
 
 		// Register before the callback. The client's first poll can beat
@@ -231,8 +291,9 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 		writeJSON(w, http.StatusOK, ConnectResponse{
 			ProtocolVersion: ProtocolVersion,
 			SessionID:       id,
-			Limits:          cfg.limits(),
+			Limits:          cfg.limits(negotiatedMode),
 			Meta:            meta,
+			PollMode:        negotiatedMode,
 		})
 	})
 }
@@ -296,6 +357,11 @@ func PollHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 			return
 		}
 
+		if s.pollMode == PollModeStream {
+			pollStream(w, r, s, cfg)
+			return
+		}
+
 		// A parked poll is proof the client is still there, and the count
 		// drops the moment this handler returns — including when the TCP
 		// connection breaks underneath it.
@@ -322,6 +388,78 @@ func PollHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 
 		w.WriteHeader(http.StatusNoContent)
 	})
+}
+
+// pollStream serves the stream-mode half of a long poll: instead of one
+// ReadAvailable call and one response, it holds the response open and keeps
+// calling ReadAvailable in a loop, writing each result out as a frame and
+// flushing immediately. cfg.HeartbeatInterval takes over ReadAvailable's
+// timeout role — "how long to wait before answering" becomes "how long to
+// wait before sending a heartbeat frame" — which is why ReadAvailable itself
+// needs no changes.
+func pollStream(w http.ResponseWriter, r *http.Request, s *Session, cfg ServerConfig) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		// Not reachable behind net/http's own server; guards against a
+		// wrapping middleware that strips Flusher and would otherwise hang
+		// this handler for cfg.StreamMaxDuration for no reason.
+		writeError(w, http.StatusInternalServerError, "response writer does not support streaming")
+		return
+	}
+
+	s.pollInFlight.Add(1)
+	defer s.pollInFlight.Add(-1)
+
+	// Headers must go out now, not on the first frame. The client's
+	// ResponseHeaderTimeout for a stream-mode poll is short (it only needs
+	// to cover connection setup, not a long-poll wait) — if this handler
+	// waited for the first heartbeat/data frame before flushing headers, an
+	// idle session would blow that timeout on every single stream poll.
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Accel-Buffering", "no") // best-effort: ask nginx-like proxies not to buffer
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	buf := make([]byte, cfg.PollBufferSize)
+	deadline := time.Now().Add(cfg.StreamMaxDuration)
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return // client or an intermediate proxy dropped the connection
+		default:
+		}
+
+		n, err := s.toClient.ReadAvailable(buf, cfg.HeartbeatInterval, cfg.CoalesceWindow)
+		switch {
+		case errors.Is(err, io.EOF):
+			// Session closed: toClient.Close() unblocks ReadAvailable with
+			// io.EOF. Clean end, same as StreamMaxDuration below.
+			writeFrame(w, frameEnd, nil)
+			flusher.Flush()
+			return
+		case n > 0:
+			if err := writeFrame(w, frameData, buf[:n]); err != nil {
+				cfg.Logger.Debug("pollmux: stream write failed, ending stream poll",
+					"session_id", s.ID, "error", err)
+				return
+			}
+			flusher.Flush()
+		default: // n == 0, err == nil: ReadAvailable's timeout fired — our heartbeat cadence
+			if err := writeFrame(w, frameHeartbeat, nil); err != nil {
+				cfg.Logger.Debug("pollmux: stream heartbeat write failed, ending stream poll",
+					"session_id", s.ID, "error", err)
+				return
+			}
+			flusher.Flush()
+		}
+
+		if time.Now().After(deadline) {
+			writeFrame(w, frameEnd, nil)
+			flusher.Flush()
+			return
+		}
+	}
 }
 
 // DeleteHandler serves DELETE {prefix}/{id}, the clean way for a client to go

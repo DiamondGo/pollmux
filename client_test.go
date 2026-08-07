@@ -1,7 +1,9 @@
 package pollmux
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -33,6 +36,12 @@ type fakeServer struct {
 
 	down chan []byte // payloads to hand back on the next poll
 
+	streamMode  bool          // if true, connect negotiates PollModeStream when asked
+	heartbeatMS int64         // Limits.HeartbeatIntervalMS to advertise
+	streamMaxMS int64         // Limits.StreamMaxDurationMS to advertise
+	streamPush  chan frameMsg // frames to write on the next stream poll
+	streamHang  bool          // if true, write headers then never push/close (watchdog test)
+
 	mu       sync.Mutex
 	sends    [][]byte
 	sendHdrs []http.Header
@@ -40,6 +49,17 @@ type fakeServer struct {
 	deletes  []string
 	connects []ConnectRequest
 }
+
+// frameMsg is one entry fed through fakeServer.streamPush: a frame the fake
+// server's stream-mode poll handler should write next.
+type frameMsg struct {
+	typ     frameType
+	payload []byte
+}
+
+func (f *fakeServer) pushData(b []byte) { f.streamPush <- frameMsg{typ: frameData, payload: b} }
+func (f *fakeServer) pushHeartbeat()    { f.streamPush <- frameMsg{typ: frameHeartbeat} }
+func (f *fakeServer) pushEnd()          { f.streamPush <- frameMsg{typ: frameEnd} }
 
 func newFakeServer(t *testing.T) *fakeServer {
 	t.Helper()
@@ -52,7 +72,8 @@ func newFakeServer(t *testing.T) *fakeServer {
 			SessionTimeoutMS: 5000,
 			PollBufferBytes:  256 << 10,
 		},
-		down: make(chan []byte, 16),
+		down:       make(chan []byte, 16),
+		streamPush: make(chan frameMsg, 16),
 	}
 	f.ts = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.ts.Close)
@@ -97,14 +118,21 @@ func (f *fakeServer) serveConnect(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, f.connectBody)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(ConnectResponse{
+	resp := ConnectResponse{
 		ProtocolVersion: ProtocolVersion,
 		SessionID:       f.sessionID,
 		Limits:          f.limits,
 		Meta:            f.connectMeta,
-	})
+	}
+	if f.streamMode && req.PreferStreamMode {
+		resp.PollMode = PollModeStream
+		resp.Limits.HeartbeatIntervalMS = f.heartbeatMS
+		resp.Limits.StreamMaxDurationMS = f.streamMaxMS
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (f *fakeServer) servePoll(w http.ResponseWriter, r *http.Request) {
@@ -136,6 +164,11 @@ func (f *fakeServer) servePoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if f.streamMode {
+		f.serveStreamPoll(w, r)
+		return
+	}
+
 	select {
 	case data := <-f.down:
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -144,6 +177,35 @@ func (f *fakeServer) servePoll(w http.ResponseWriter, r *http.Request) {
 	case <-time.After(f.limits.PollTimeout()):
 		w.WriteHeader(http.StatusNoContent)
 	case <-r.Context().Done():
+	}
+}
+
+// serveStreamPoll mirrors pollStream's own contract (immediate header flush,
+// then frames pushed as they become available) closely enough that a client
+// test exercising it validates the same timing contract the real server
+// makes, not a looser one.
+func (f *fakeServer) serveStreamPoll(w http.ResponseWriter, r *http.Request) {
+	flusher := w.(http.Flusher)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	if f.streamHang {
+		<-r.Context().Done()
+		return
+	}
+
+	for {
+		select {
+		case msg := <-f.streamPush:
+			writeFrame(w, msg.typ, msg.payload)
+			flusher.Flush()
+			if msg.typ == frameEnd {
+				return
+			}
+		case <-r.Context().Done():
+			return
+		}
 	}
 }
 
@@ -676,4 +738,370 @@ func (b *atomic32Bool) Load() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.v
+}
+
+// --- frameReader unit tests -------------------------------------------------
+
+func TestFrameReaderHandlesFramesSplitAcrossReads(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeFrame(&buf, frameData, []byte("hello")); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if err := writeFrame(&buf, frameHeartbeat, nil); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if err := writeFrame(&buf, frameData, []byte("world")); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+
+	// One byte per Read call is the sharpest possible version of "a frame's
+	// header and payload don't arrive together" — chunked transfer gives no
+	// guarantee they will.
+	fr := newFrameReader(iotest.OneByteReader(&buf), 1<<10)
+
+	typ, payload, err := fr.next()
+	if err != nil || typ != frameData || string(payload) != "hello" {
+		t.Fatalf("frame 1 = (%v, %q, %v), want (frameData, %q, nil)", typ, payload, err, "hello")
+	}
+	typ, _, err = fr.next()
+	if err != nil || typ != frameHeartbeat {
+		t.Fatalf("frame 2 = (%v, %v), want (frameHeartbeat, nil)", typ, err)
+	}
+	typ, payload, err = fr.next()
+	if err != nil || typ != frameData || string(payload) != "world" {
+		t.Fatalf("frame 3 = (%v, %q, %v), want (frameData, %q, nil)", typ, payload, err, "world")
+	}
+	if _, _, err := fr.next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("next after last frame = %v, want io.EOF", err)
+	}
+}
+
+func TestFrameReaderDistinguishesCleanEOFFromMidFrameEOF(t *testing.T) {
+	t.Run("clean boundary", func(t *testing.T) {
+		var buf bytes.Buffer
+		writeFrame(&buf, frameHeartbeat, nil)
+		fr := newFrameReader(&buf, 1<<10)
+		if _, _, err := fr.next(); err != nil {
+			t.Fatalf("first frame: %v", err)
+		}
+		if _, _, err := fr.next(); !errors.Is(err, io.EOF) {
+			t.Fatalf("next at a clean boundary = %v, want io.EOF", err)
+		}
+	})
+	t.Run("mid-header", func(t *testing.T) {
+		fr := newFrameReader(bytes.NewReader([]byte{0x01, 0x00}), 1<<10)
+		if _, _, err := fr.next(); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("next mid-header = %v, want io.ErrUnexpectedEOF", err)
+		}
+	})
+	t.Run("mid-payload", func(t *testing.T) {
+		var buf bytes.Buffer
+		writeFrame(&buf, frameData, []byte("hello"))
+		truncated := buf.Bytes()[:frameHeaderLen+2] // header + 2 of 5 payload bytes
+		fr := newFrameReader(bytes.NewReader(truncated), 1<<10)
+		if _, _, err := fr.next(); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("next mid-payload = %v, want io.ErrUnexpectedEOF", err)
+		}
+	})
+}
+
+func TestFrameReaderRejectsOversizedLength(t *testing.T) {
+	var hdr [frameHeaderLen]byte
+	hdr[0] = byte(frameData)
+	binary.BigEndian.PutUint32(hdr[1:], 1000)
+	fr := newFrameReader(bytes.NewReader(hdr[:]), 100)
+	if _, _, err := fr.next(); err == nil {
+		t.Fatal("next accepted a frame length above maxPayload without allocating")
+	}
+}
+
+// --- client-side stream mode tests ------------------------------------------
+
+func TestClientStreamModeDeliversDataWithoutWaitingForResponseEnd(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	f.pushData([]byte("a"))
+	buf := make([]byte, 8)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if string(buf[:n]) != "a" {
+		t.Fatalf("Read = %q, want %q", buf[:n], "a")
+	}
+
+	// No pushEnd: the same response stays open. Reading "b" here — instead
+	// of only after the response ends — is the direct proof the client
+	// decodes incrementally rather than io.ReadAll-ing the whole body.
+	f.pushData([]byte("b"))
+	n, err = conn.Read(buf)
+	if err != nil {
+		t.Fatalf("second Read: %v", err)
+	}
+	if string(buf[:n]) != "b" {
+		t.Fatalf("second Read = %q, want %q", buf[:n], "b")
+	}
+}
+
+func TestClientFallsBackToBatchWhenServerDoesNotOfferStream(t *testing.T) {
+	f := newFakeServer(t) // f.streamMode left false: connect never returns PollMode
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	f.down <- []byte("batch payload")
+	buf := make([]byte, 32)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if string(buf[:n]) != "batch payload" {
+		t.Fatalf("Read = %q, want %q", buf[:n], "batch payload")
+	}
+}
+
+func TestStreamIdleWatchdogTriggersTransportFailed(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 30
+	f.streamMaxMS = 5000
+	f.streamHang = true // headers arrive, then nothing — the watchdog must catch this
+
+	c := f.connector()
+	c.PreferStream = true
+	c.PollGrace = 50 * time.Millisecond // idle timeout = heartbeatMS + PollGrace = 80ms
+	conn := mustConnect(t, c)
+
+	select {
+	case <-conn.TransportFailed():
+		t.Fatal("transport failed immediately, before the idle watchdog interval elapsed")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	select {
+	case <-conn.TransportFailed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("TransportFailed did not fire after the idle watchdog should have expired")
+	}
+}
+
+func TestStreamEndFrameReopensPollWithoutFailure(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	f.pushEnd() // ends the first stream-mode poll response cleanly
+
+	waitFor(t, 2*time.Second, func() bool { return f.pollCount() >= 2 })
+	f.pushData([]byte("after reopen"))
+
+	buf := make([]byte, 32)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if string(buf[:n]) != "after reopen" {
+		t.Fatalf("Read = %q, want %q", buf[:n], "after reopen")
+	}
+
+	select {
+	case <-conn.TransportFailed():
+		t.Fatal("a clean end frame must not be treated as a transport failure")
+	default:
+	}
+}
+
+func TestCloseIsPromptDuringLongStreamPoll(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 10000
+	f.streamMaxMS = 30000
+	f.streamHang = true
+
+	c := f.connector()
+	c.PreferStream = true
+	c.PollGrace = 30 * time.Second // must not race the Close
+	conn, err := c.Connect(context.Background())
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	waitFor(t, 2*time.Second, func() bool { return f.pollCount() >= 1 })
+
+	start := time.Now()
+	conn.Close()
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("Close took %v while a stream poll was parked; it must cancel the request, not wait it out", elapsed)
+	}
+}
+
+func TestConnectRejectsStreamModeWithNonPositiveHeartbeat(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 0 // server negotiates stream but forgets to send a heartbeat interval
+	f.streamMaxMS = 5000
+
+	c := f.connector()
+	c.PreferStream = true
+	if _, err := c.Connect(context.Background()); err == nil {
+		t.Fatal("Connect succeeded despite a non-positive heartbeat_interval_ms in a stream-mode response")
+	}
+}
+
+func TestConnectRejectsStreamModeWithNonPositiveStreamMaxDuration(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 0
+
+	c := f.connector()
+	c.PreferStream = true
+	if _, err := c.Connect(context.Background()); err == nil {
+		t.Fatal("Connect succeeded despite a non-positive stream_max_duration_ms in a stream-mode response")
+	}
+}
+
+func TestLocalHealthIsPiggybackedOnStreamPolls(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	var healthy atomic32Bool
+	healthy.Store(true)
+
+	c := f.connector()
+	c.PreferStream = true
+	c.LocalHealth = func() bool { return healthy.Load() }
+	mustConnect(t, c)
+
+	waitFor(t, 2*time.Second, func() bool { return f.pollCount() >= 1 })
+	f.mu.Lock()
+	first := f.pollHdrs[0].Get(HeaderLocalHealth)
+	f.mu.Unlock()
+	if first != "ok" {
+		t.Fatalf("%s = %q on a healthy client, want %q", HeaderLocalHealth, first, "ok")
+	}
+}
+
+func TestClientStreamModeTreatsSessionGoneAsFailure(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	f.mu.Lock()
+	f.pollStatus = http.StatusGone
+	f.mu.Unlock()
+
+	// End the current stream poll so the client opens a fresh one, which
+	// hits the now-410 fakeServer path.
+	f.pushEnd()
+
+	select {
+	case <-conn.TransportFailed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("TransportFailed did not fire after the server reported the session gone (410)")
+	}
+}
+
+func TestClientStreamModeHandlesHeartbeatFramesWithoutData(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	f.pushHeartbeat()
+	f.pushHeartbeat()
+	f.pushData([]byte("after heartbeats"))
+
+	buf := make([]byte, 32)
+	done := make(chan struct{})
+	var n int
+	var err error
+	go func() {
+		n, err = conn.Read(buf)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read never returned after heartbeat frames were skipped")
+	}
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if string(buf[:n]) != "after heartbeats" {
+		t.Fatalf("Read = %q, want %q", buf[:n], "after heartbeats")
+	}
+
+	select {
+	case <-conn.TransportFailed():
+		t.Fatal("heartbeat frames must not be treated as a transport failure")
+	default:
+	}
+}
+
+func TestClientStreamModeFailsOnUnknownFrameType(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	f.streamPush <- frameMsg{typ: frameType(0x7F)}
+
+	select {
+	case <-conn.TransportFailed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("an unknown stream frame type must be treated as a transport failure")
+	}
+}
+
+func TestClientStreamModeFallsBackToDefaultFrameSizeWhenServerOmitsPollBufferBytes(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+	f.limits.PollBufferBytes = 0 // server sent no poll_buffer_bytes at all
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	// If the client left its frame-size cap at 0 instead of falling back to
+	// DefaultPollBufferSize, decoding this frame would fail outright.
+	f.pushData([]byte("still works"))
+	buf := make([]byte, 32)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if string(buf[:n]) != "still works" {
+		t.Fatalf("Read = %q, want %q", buf[:n], "still works")
+	}
 }

@@ -40,6 +40,14 @@ const (
 	DefaultSweepInterval  = 5 * time.Second
 	DefaultPollBufferSize = 256 << 10 // B1 first layer: was a hard-coded 64KB
 	DefaultMaxSendBytes   = 1 << 20
+
+	// DefaultHeartbeatInterval and DefaultStreamMaxDuration only apply when
+	// ServerConfig.PollMode == PollModeStream.
+	DefaultHeartbeatInterval = 10 * time.Second
+	// DefaultStreamMaxDuration is kept comfortably under common intermediate
+	// proxy read/idle timeouts (a 60s timeout is common; sitting right on top
+	// of it leaves no margin), not just under SessionTimeout.
+	DefaultStreamMaxDuration = 45 * time.Second
 )
 
 // Client-side defaults. See Connector.
@@ -74,6 +82,11 @@ type ConnectRequest struct {
 	// Meta is application-defined and opaque to pollmux — a relay might put
 	// {role, endpoint} here, a tunnel service {client_id}.
 	Meta map[string]string `json:"meta,omitempty"`
+	// PreferStreamMode asks the server to negotiate PollModeStream for this
+	// session. Ignored (silently falls back to batch) unless the server's own
+	// ServerConfig.PollMode is PollModeStream — the server is always the
+	// authority on what it supports.
+	PreferStreamMode bool `json:"prefer_stream_mode,omitempty"`
 }
 
 // Limits are the transport parameters the server hands down at connect time.
@@ -90,6 +103,11 @@ type Limits struct {
 	PollTimeoutMS    int64 `json:"poll_timeout_ms"`
 	SessionTimeoutMS int64 `json:"session_timeout_ms"`
 	PollBufferBytes  int   `json:"poll_buffer_bytes"`
+	// HeartbeatIntervalMS and StreamMaxDurationMS are only set when this
+	// connect negotiated PollModeStream (see ConnectResponse.PollMode). Zero
+	// in a batch-mode response, same as today.
+	HeartbeatIntervalMS int64 `json:"heartbeat_interval_ms,omitempty"`
+	StreamMaxDurationMS int64 `json:"stream_max_duration_ms,omitempty"`
 }
 
 // PollTimeout returns PollTimeoutMS as a duration.
@@ -100,6 +118,16 @@ func (l Limits) PollTimeout() time.Duration {
 // SessionTimeout returns SessionTimeoutMS as a duration.
 func (l Limits) SessionTimeout() time.Duration {
 	return time.Duration(l.SessionTimeoutMS) * time.Millisecond
+}
+
+// HeartbeatInterval returns HeartbeatIntervalMS as a duration.
+func (l Limits) HeartbeatInterval() time.Duration {
+	return time.Duration(l.HeartbeatIntervalMS) * time.Millisecond
+}
+
+// StreamMaxDuration returns StreamMaxDurationMS as a duration.
+func (l Limits) StreamMaxDuration() time.Duration {
+	return time.Duration(l.StreamMaxDurationMS) * time.Millisecond
 }
 
 // Validate rejects limits that cannot be honoured, so a client fails at connect
@@ -125,6 +153,11 @@ type ConnectResponse struct {
 	// Meta is produced by Hooks.Authenticate and merged with what the client
 	// declared. Opaque to pollmux.
 	Meta map[string]string `json:"meta,omitempty"`
+	// PollMode is the mode the server actually negotiated for this session:
+	// PollModeBatch or PollModeStream. Empty (old server, or a server that
+	// doesn't know this field) means batch — new clients must treat an
+	// empty/unrecognized value as batch, never as an error.
+	PollMode string `json:"poll_mode,omitempty"`
 }
 
 // errorResponse is the JSON body of any non-2xx answer from the handlers.

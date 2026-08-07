@@ -3,6 +3,8 @@ package pollmux
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -610,7 +612,18 @@ func TestServerConfigRejectsUnknownPollMode(t *testing.T) {
 		}
 	}()
 	cfg := testServerConfig()
-	cfg.PollMode = "stream"
+	cfg.PollMode = "carrier-pigeon"
+	ConnectHandler(NewSessionStore(), cfg, Hooks{})
+}
+
+func TestServerConfigAcceptsStreamPollMode(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("PollModeStream was rejected: %v", r)
+		}
+	}()
+	cfg := testServerConfig()
+	cfg.PollMode = PollModeStream
 	ConnectHandler(NewSessionStore(), cfg, Hooks{})
 }
 
@@ -630,6 +643,19 @@ func TestServerConfigRejectsTooShortSessionTimeout(t *testing.T) {
 	ConnectHandler(NewSessionStore(), cfg, Hooks{})
 }
 
+func TestServerConfigRejectsTooShortStreamMaxDuration(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("a StreamMaxDuration below 2x HeartbeatInterval was accepted")
+		}
+	}()
+	cfg := testServerConfig()
+	cfg.PollMode = PollModeStream
+	cfg.HeartbeatInterval = 10 * time.Second
+	cfg.StreamMaxDuration = 15 * time.Second // < 2x HeartbeatInterval
+	ConnectHandler(NewSessionStore(), cfg, Hooks{})
+}
+
 func TestServerConfigDefaultsAreCoherent(t *testing.T) {
 	cfg := ServerConfig{}.withDefaults()
 
@@ -639,7 +665,7 @@ func TestServerConfigDefaultsAreCoherent(t *testing.T) {
 	if cfg.PollBufferSize != DefaultPollBufferSize {
 		t.Fatalf("default PollBufferSize = %d, want %d", cfg.PollBufferSize, DefaultPollBufferSize)
 	}
-	l := cfg.limits()
+	l := cfg.limits("")
 	if l.PollTimeoutMS != DefaultPollTimeout.Milliseconds() {
 		t.Fatalf("limits poll_timeout_ms = %d, want %d", l.PollTimeoutMS, DefaultPollTimeout.Milliseconds())
 	}
@@ -670,5 +696,351 @@ func TestPollResponseIsCappedByPollBufferSize(t *testing.T) {
 
 	if len(body) != 100 {
 		t.Fatalf("second poll returned %d bytes, want the next 100", len(body))
+	}
+}
+
+// --- stream mode negotiation -------------------------------------------------
+
+func TestConnectNegotiatesStreamModeWhenBothSidesAgree(t *testing.T) {
+	cfg := testServerConfig()
+	cfg.PollMode = PollModeStream
+	cfg.HeartbeatInterval = 111 * time.Millisecond
+	cfg.StreamMaxDuration = 999 * time.Millisecond
+	ts, _ := newTestServer(t, cfg, Hooks{})
+
+	_, cr := postConnect(t, ts, ConnectRequest{ProtocolVersion: ProtocolVersion, PreferStreamMode: true})
+	if cr.PollMode != PollModeStream {
+		t.Fatalf("PollMode = %q, want %q", cr.PollMode, PollModeStream)
+	}
+	if cr.Limits.HeartbeatInterval() != cfg.HeartbeatInterval {
+		t.Fatalf("heartbeat_interval_ms = %v, want %v", cr.Limits.HeartbeatInterval(), cfg.HeartbeatInterval)
+	}
+	if cr.Limits.StreamMaxDuration() != cfg.StreamMaxDuration {
+		t.Fatalf("stream_max_duration_ms = %v, want %v", cr.Limits.StreamMaxDuration(), cfg.StreamMaxDuration)
+	}
+}
+
+func TestConnectStaysBatchWhenServerDoesNotOfferStream(t *testing.T) {
+	cfg := testServerConfig() // PollMode left at "" (batch)
+	ts, _ := newTestServer(t, cfg, Hooks{})
+
+	_, cr := postConnect(t, ts, ConnectRequest{ProtocolVersion: ProtocolVersion, PreferStreamMode: true})
+	if cr.PollMode == PollModeStream {
+		t.Fatalf("PollMode = %q, want batch when the server does not offer stream", cr.PollMode)
+	}
+	if cr.Limits.HeartbeatIntervalMS != 0 {
+		t.Fatalf("HeartbeatIntervalMS = %d, want 0 for a batch-negotiated session", cr.Limits.HeartbeatIntervalMS)
+	}
+}
+
+func TestConnectStaysBatchWhenClientDoesNotPreferStream(t *testing.T) {
+	cfg := testServerConfig()
+	cfg.PollMode = PollModeStream
+	ts, _ := newTestServer(t, cfg, Hooks{})
+
+	_, cr := postConnect(t, ts, ConnectRequest{ProtocolVersion: ProtocolVersion}) // PreferStreamMode left false
+	if cr.PollMode == PollModeStream {
+		t.Fatalf("PollMode = %q, want batch when the client does not prefer stream", cr.PollMode)
+	}
+}
+
+// --- pollStream ---------------------------------------------------------------
+
+func testStreamServerConfig() ServerConfig {
+	cfg := testServerConfig()
+	cfg.PollMode = PollModeStream
+	cfg.HeartbeatInterval = 5 * time.Second
+	cfg.StreamMaxDuration = 10 * time.Second
+	return cfg
+}
+
+func connectStream(t *testing.T, ts *httptest.Server) ConnectResponse {
+	t.Helper()
+	resp, cr := postConnect(t, ts, ConnectRequest{ProtocolVersion: ProtocolVersion, PreferStreamMode: true})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("connect status = %d, want 200", resp.StatusCode)
+	}
+	if cr.PollMode != PollModeStream {
+		t.Fatalf("PollMode = %q, want %q — stream mode did not negotiate", cr.PollMode, PollModeStream)
+	}
+	return cr
+}
+
+func TestPollStreamDeliversFramesWithoutHandlerReturning(t *testing.T) {
+	// HeartbeatInterval stays at testStreamServerConfig's generous default
+	// (well above the write cadence below, with margin for scheduling
+	// jitter under a loaded machine) — the test closes the session
+	// explicitly at the end instead, so the handler ends promptly without
+	// depending on a short heartbeat for teardown speed.
+	cfg := testStreamServerConfig()
+	ts, st := newTestServer(t, cfg, Hooks{})
+	cr := connectStream(t, ts)
+	s, _ := st.Get(cr.SessionID)
+
+	resp := poll(t, ts, cr.SessionID, nil, map[string]string{HeaderReceiveOnly: "true"})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream poll status = %d, want 200", resp.StatusCode)
+	}
+	fr := newFrameReader(resp.Body, 1<<20)
+
+	chunks := [][]byte{[]byte("first"), []byte("second"), []byte("third")}
+	go func() {
+		for _, c := range chunks {
+			// Comfortably above cfg.CoalesceWindow (5ms) and any scheduling
+			// jitter under a loaded machine (e.g. -race), so consecutive
+			// writes reliably land as separate frames instead of merging.
+			time.Sleep(150 * time.Millisecond)
+			s.Write(c)
+		}
+	}()
+
+	// Each chunk must arrive as its own frame while the HTTP response is
+	// still open — proof pollStream doesn't wait for the handler to return
+	// before the client can see data, which is the entire point of stream
+	// mode.
+	for i, want := range chunks {
+		typ, payload, err := fr.next()
+		if err != nil {
+			t.Fatalf("frame %d: next: %v", i, err)
+		}
+		if typ != frameData {
+			t.Fatalf("frame %d: type = %v, want frameData", i, typ)
+		}
+		if string(payload) != string(want) {
+			t.Fatalf("frame %d: payload = %q, want %q", i, payload, want)
+		}
+	}
+
+	// End the stream promptly instead of leaving it parked until
+	// HeartbeatInterval or StreamMaxDuration, so test teardown is fast.
+	s.Close()
+}
+
+func TestPollStreamSendsHeartbeatWhenIdle(t *testing.T) {
+	cfg := testStreamServerConfig()
+	cfg.HeartbeatInterval = 30 * time.Millisecond
+	cfg.StreamMaxDuration = 500 * time.Millisecond
+	ts, _ := newTestServer(t, cfg, Hooks{})
+	cr := connectStream(t, ts)
+
+	resp := poll(t, ts, cr.SessionID, nil, map[string]string{HeaderReceiveOnly: "true"})
+	defer resp.Body.Close()
+	fr := newFrameReader(resp.Body, 1<<20)
+
+	typ, _, err := fr.next()
+	if err != nil {
+		t.Fatalf("next: %v", err)
+	}
+	if typ != frameHeartbeat {
+		t.Fatalf("frame type = %v, want frameHeartbeat", typ)
+	}
+}
+
+func TestPollStreamEndsAtMaxDuration(t *testing.T) {
+	cfg := testStreamServerConfig()
+	cfg.HeartbeatInterval = 20 * time.Millisecond
+	cfg.StreamMaxDuration = 80 * time.Millisecond
+	ts, _ := newTestServer(t, cfg, Hooks{})
+	cr := connectStream(t, ts)
+
+	start := time.Now()
+	resp := poll(t, ts, cr.SessionID, nil, map[string]string{HeaderReceiveOnly: "true"})
+	defer resp.Body.Close()
+	fr := newFrameReader(resp.Body, 1<<20)
+
+	sawEnd := false
+	for {
+		typ, _, err := fr.next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("next: %v", err)
+		}
+		if typ == frameEnd {
+			sawEnd = true
+		}
+	}
+	if !sawEnd {
+		t.Fatal("body ended without an explicit frameEnd")
+	}
+	if elapsed := time.Since(start); elapsed < cfg.StreamMaxDuration {
+		t.Fatalf("stream ended after %v, want at least StreamMaxDuration=%v", elapsed, cfg.StreamMaxDuration)
+	} else if elapsed > cfg.StreamMaxDuration+2*time.Second {
+		t.Fatalf("stream ended after %v, too long past StreamMaxDuration=%v", elapsed, cfg.StreamMaxDuration)
+	}
+}
+
+func TestPollStreamEndsWhenSessionCloses(t *testing.T) {
+	cfg := testStreamServerConfig()
+	ts, st := newTestServer(t, cfg, Hooks{})
+	cr := connectStream(t, ts)
+	s, _ := st.Get(cr.SessionID)
+
+	resp := poll(t, ts, cr.SessionID, nil, map[string]string{HeaderReceiveOnly: "true"})
+	defer resp.Body.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		fr := newFrameReader(resp.Body, 1<<20)
+		typ, _, err := fr.next()
+		if err != nil {
+			done <- err
+			return
+		}
+		if typ != frameEnd {
+			done <- fmt.Errorf("frame type = %v, want frameEnd", typ)
+			return
+		}
+		_, _, err = fr.next()
+		done <- err // want io.EOF: the response body closing right after frameEnd
+	}()
+
+	time.Sleep(20 * time.Millisecond) // let the poll actually park before closing
+	s.Close()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("after frameEnd, next() = %v, want io.EOF", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the stream to end after the session closed")
+	}
+}
+
+func TestPollStreamCapsDataFrameAtPollBufferSize(t *testing.T) {
+	cfg := testStreamServerConfig()
+	cfg.PollBufferSize = 100
+	ts, st := newTestServer(t, cfg, Hooks{})
+	cr := connectStream(t, ts)
+	s, _ := st.Get(cr.SessionID)
+
+	resp := poll(t, ts, cr.SessionID, nil, map[string]string{HeaderReceiveOnly: "true"})
+	defer resp.Body.Close()
+	fr := newFrameReader(resp.Body, 1<<20)
+
+	s.Write(make([]byte, 250))
+
+	typ, payload, err := fr.next()
+	if err != nil {
+		t.Fatalf("first frame: next: %v", err)
+	}
+	if typ != frameData || len(payload) != 100 {
+		t.Fatalf("first frame: type=%v len=%d, want frameData len 100", typ, len(payload))
+	}
+
+	typ, payload, err = fr.next()
+	if err != nil {
+		t.Fatalf("second frame: next: %v", err)
+	}
+	if typ != frameData || len(payload) != 100 {
+		t.Fatalf("second frame: type=%v len=%d, want frameData len 100", typ, len(payload))
+	}
+}
+
+// headerOnlyResponseWriter implements http.ResponseWriter but deliberately
+// not http.Flusher, exercising pollStream's guard against a wrapping
+// middleware that strips Flusher.
+type headerOnlyResponseWriter struct {
+	header http.Header
+	status int
+}
+
+func (w *headerOnlyResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+func (w *headerOnlyResponseWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *headerOnlyResponseWriter) WriteHeader(status int)      { w.status = status }
+
+func TestPollStreamRequiresFlusher(t *testing.T) {
+	cfg := testStreamServerConfig().withDefaults()
+	s := newSession("sess-flusher", nil)
+	s.pollMode = PollModeStream
+
+	w := &headerOnlyResponseWriter{}
+	r := httptest.NewRequest(http.MethodPost, "/tunnel/sess-flusher/poll", nil)
+	pollStream(w, r, s, cfg)
+
+	if w.status != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d when the ResponseWriter does not support http.Flusher",
+			w.status, http.StatusInternalServerError)
+	}
+}
+
+// failingFlusher implements http.ResponseWriter and http.Flusher, but every
+// Write after the response header returns an error — simulating a client
+// that disconnected mid-stream, without needing a real broken TCP
+// connection.
+type failingFlusher struct {
+	header     http.Header
+	status     int
+	headerSent bool
+	writeErr   error
+}
+
+func (w *failingFlusher) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+func (w *failingFlusher) WriteHeader(status int) { w.status = status; w.headerSent = true }
+func (w *failingFlusher) Write(p []byte) (int, error) {
+	if w.headerSent {
+		return 0, w.writeErr
+	}
+	return len(p), nil
+}
+func (w *failingFlusher) Flush() {}
+
+func TestPollStreamEndsPromptlyWhenDataFrameWriteFails(t *testing.T) {
+	cfg := testStreamServerConfig().withDefaults()
+	s := newSession("sess-write-fail-data", nil)
+	s.pollMode = PollModeStream
+	s.Write([]byte("data ready before the poll starts"))
+
+	w := &failingFlusher{writeErr: io.ErrClosedPipe}
+	r := httptest.NewRequest(http.MethodPost, "/tunnel/sess-write-fail-data/poll", nil)
+
+	done := make(chan struct{})
+	go func() {
+		pollStream(w, r, s, cfg)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pollStream did not return after a data frame write failure")
+	}
+}
+
+func TestPollStreamEndsPromptlyWhenHeartbeatFrameWriteFails(t *testing.T) {
+	cfg := testStreamServerConfig()
+	cfg.HeartbeatInterval = 10 * time.Millisecond
+	cfg = cfg.withDefaults()
+	s := newSession("sess-write-fail-heartbeat", nil)
+	s.pollMode = PollModeStream
+	// No data written: ReadAvailable times out and pollStream tries to send
+	// a heartbeat frame, which the writer rejects.
+
+	w := &failingFlusher{writeErr: io.ErrClosedPipe}
+	r := httptest.NewRequest(http.MethodPost, "/tunnel/sess-write-fail-heartbeat/poll", nil)
+
+	done := make(chan struct{})
+	go func() {
+		pollStream(w, r, s, cfg)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pollStream did not return after a heartbeat frame write failure")
 	}
 }
