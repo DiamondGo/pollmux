@@ -872,6 +872,11 @@ func TestPollStreamEndsAtMaxDuration(t *testing.T) {
 	}
 }
 
+// TestPollStreamEndsWhenSessionCloses checks the fatal path: the session
+// closing mid-poll must produce frameGone, not frameEnd — reusing frameEnd
+// here would make the client reopen a poll against a session that no longer
+// exists instead of surfacing a failure (this is exactly what broke
+// HttpBroker's provider-reconnect flow before frameGone existed).
 func TestPollStreamEndsWhenSessionCloses(t *testing.T) {
 	cfg := testStreamServerConfig()
 	ts, st := newTestServer(t, cfg, Hooks{})
@@ -889,12 +894,12 @@ func TestPollStreamEndsWhenSessionCloses(t *testing.T) {
 			done <- err
 			return
 		}
-		if typ != frameEnd {
-			done <- fmt.Errorf("frame type = %v, want frameEnd", typ)
+		if typ != frameGone {
+			done <- fmt.Errorf("frame type = %v, want frameGone", typ)
 			return
 		}
 		_, _, err = fr.next()
-		done <- err // want io.EOF: the response body closing right after frameEnd
+		done <- err // want io.EOF: the response body closing right after frameGone
 	}()
 
 	time.Sleep(20 * time.Millisecond) // let the poll actually park before closing
@@ -903,10 +908,40 @@ func TestPollStreamEndsWhenSessionCloses(t *testing.T) {
 	select {
 	case err := <-done:
 		if !errors.Is(err, io.EOF) {
-			t.Fatalf("after frameEnd, next() = %v, want io.EOF", err)
+			t.Fatalf("after frameGone, next() = %v, want io.EOF", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for the stream to end after the session closed")
+	}
+}
+
+// TestPollStreamDistinguishesGoneFromMaxDurationEnd is the regression test
+// for the frameEnd/frameGone conflation bug: a session that closes mid-poll
+// must send frameGone (fatal), and StreamMaxDuration rolling over on a
+// still-alive session must keep sending frameEnd (benign) — the two must
+// never collapse onto the same frame type again.
+func TestPollStreamDistinguishesGoneFromMaxDurationEnd(t *testing.T) {
+	cfg := testStreamServerConfig()
+	cfg.HeartbeatInterval = 20 * time.Millisecond
+	cfg.StreamMaxDuration = 80 * time.Millisecond
+	ts, _ := newTestServer(t, cfg, Hooks{})
+	cr := connectStream(t, ts)
+
+	resp := poll(t, ts, cr.SessionID, nil, map[string]string{HeaderReceiveOnly: "true"})
+	defer resp.Body.Close()
+	fr := newFrameReader(resp.Body, 1<<20)
+
+	for {
+		typ, _, err := fr.next()
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if typ == frameGone {
+			t.Fatal("StreamMaxDuration rollover must send frameEnd, not frameGone — the session is still alive")
+		}
+		if typ == frameEnd {
+			return
+		}
 	}
 }
 

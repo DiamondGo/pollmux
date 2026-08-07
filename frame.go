@@ -14,12 +14,21 @@ type frameType byte
 const (
 	frameData      frameType = 0x01
 	frameHeartbeat frameType = 0x02
-	frameEnd       frameType = 0x03
+	// frameEnd is a benign end: StreamMaxDuration rolled over, or the client
+	// itself is going away. The session is still alive — the client should
+	// simply reopen a new stream poll.
+	frameEnd frameType = 0x03
+	// frameGone is a fatal end: the session was closed server-side (evicted,
+	// deleted, or superseded) while this poll was parked. Reopening a poll
+	// against the same session id would just get frameGone again forever, so
+	// the client must treat this the same as batch mode's 410 — surface
+	// TransportFailed and let the caller reconnect with a fresh session.
+	frameGone frameType = 0x04
 )
 
 // frameHeaderLen is 1 byte type + 4 byte big-endian length. Only frameData
-// gives the length field meaning; frameHeartbeat and frameEnd always encode
-// zero length and carry no payload.
+// gives the length field meaning; frameHeartbeat, frameEnd, and frameGone
+// always encode zero length and carry no payload.
 const frameHeaderLen = 5
 
 // writeFrame writes one frame to w. It does not flush — the caller (a

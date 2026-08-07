@@ -434,8 +434,11 @@ func pollStream(w http.ResponseWriter, r *http.Request, s *Session, cfg ServerCo
 		switch {
 		case errors.Is(err, io.EOF):
 			// Session closed: toClient.Close() unblocks ReadAvailable with
-			// io.EOF. Clean end, same as StreamMaxDuration below.
-			writeFrame(w, frameEnd, nil)
+			// io.EOF. This is fatal, unlike the StreamMaxDuration rollover
+			// below — the session is gone, so a frameGone (not frameEnd)
+			// tells the client to stop reopening polls against this session
+			// id and reconnect instead, the same role batch mode's 410 plays.
+			writeFrame(w, frameGone, nil)
 			flusher.Flush()
 			return
 		case n > 0:

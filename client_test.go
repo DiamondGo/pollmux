@@ -60,6 +60,7 @@ type frameMsg struct {
 func (f *fakeServer) pushData(b []byte) { f.streamPush <- frameMsg{typ: frameData, payload: b} }
 func (f *fakeServer) pushHeartbeat()    { f.streamPush <- frameMsg{typ: frameHeartbeat} }
 func (f *fakeServer) pushEnd()          { f.streamPush <- frameMsg{typ: frameEnd} }
+func (f *fakeServer) pushGone()         { f.streamPush <- frameMsg{typ: frameGone} }
 
 func newFakeServer(t *testing.T) *fakeServer {
 	t.Helper()
@@ -200,7 +201,7 @@ func (f *fakeServer) serveStreamPoll(w http.ResponseWriter, r *http.Request) {
 		case msg := <-f.streamPush:
 			writeFrame(w, msg.typ, msg.payload)
 			flusher.Flush()
-			if msg.typ == frameEnd {
+			if msg.typ == frameEnd || msg.typ == frameGone {
 				return
 			}
 		case <-r.Context().Done():
@@ -1018,6 +1019,31 @@ func TestClientStreamModeTreatsSessionGoneAsFailure(t *testing.T) {
 	case <-conn.TransportFailed():
 	case <-time.After(2 * time.Second):
 		t.Fatal("TransportFailed did not fire after the server reported the session gone (410)")
+	}
+}
+
+// TestClientStreamModeTreatsFrameGoneAsFailure exercises the real server
+// path (a session closing mid-poll writes frameGone — see pollStream's
+// io.EOF case in handler.go), as opposed to the synthetic 410-on-reopen path
+// above. Before frameGone existed, the server wrote frameEnd for this case
+// too, and the client treated it as benign and reopened a poll against the
+// now-nonexistent session forever instead of ever reconnecting.
+func TestClientStreamModeTreatsFrameGoneAsFailure(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	f.pushGone()
+
+	select {
+	case <-conn.TransportFailed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("TransportFailed did not fire after the server sent frameGone")
 	}
 }
 

@@ -53,6 +53,8 @@ batch 模式下行的含义要算一下：`poll_buffer_bytes` 默认 256KB，在
 
 客户端侧多一层存活性检测：流式响应的 HTTP 响应头几乎立刻返回（不像 batch 要等一整个长轮询超时），所以 `ResponseHeaderTimeout` 只覆盖连接建立，不再是"链路是否还活着"的信号；取而代之的是一个读空闲看门狗，每收到一帧（心跳或数据）就重置，超过 `HeartbeatInterval + PollGrace` 没收到任何帧就判定传输失败。
 
+响应体内部有四种帧：`frameData`（数据）、`frameHeartbeat`（心跳）、`frameEnd`（良性结束——`StreamMaxDuration` 到期轮转，会话仍然活着，客户端应立即重开一条新的流式轮询）、`frameGone`（致命结束——会话已经在服务端被关闭，重开轮询只会对着一个不存在的 session id 反复拿到同样的 `frameGone`，客户端必须把它当成 batch 模式里 410 的等价物，触发 `TransportFailed` 走重连，而不是重开轮询）。这两种"结束"语义不同，帧类型也必须不同——`v0.1.0` 曾经两者共用 `frameEnd`，导致会话被关闭后客户端分不清，一直对着死会话重开轮询，`v0.1.1` 起分离为独立帧类型修复。
+
 ---
 
 ## 协议与行为约定

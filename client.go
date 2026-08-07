@@ -578,6 +578,13 @@ func (c *httpConn) doPoll(readCap int64) (bool, error) {
 // right after data arrives.
 var errStreamEnd = errors.New("pollmux: stream poll ended cleanly")
 
+// errSessionGone is doStreamPoll's sentinel for a frameGone frame: the
+// session was closed server-side. pollLoopStream treats any error other
+// than errStreamEnd as fatal, so returning this (rather than errStreamEnd)
+// is what makes pollLoopStream call c.fail() instead of reopening a poll
+// against a session that no longer exists.
+var errSessionGone = errors.New("pollmux: session closed by server")
+
 // pollLoopStream is pollLoop's stream-mode counterpart: it holds one
 // long-lived poll response open at a time and decodes frames from it as they
 // arrive, instead of one discrete request per buffer. It is a separate loop
@@ -677,6 +684,12 @@ func (c *httpConn) doStreamPoll() error {
 			// nothing to do beyond the watchdog reset above
 		case frameEnd:
 			return errStreamEnd
+		case frameGone:
+			// The session was closed server-side. Unlike frameEnd, reopening
+			// a poll against this same session id would just get frameGone
+			// again forever — this is fatal, the same role batch mode's 410
+			// plays, so pollLoopStream must call c.fail() instead of looping.
+			return errSessionGone
 		default:
 			return fmt.Errorf("pollmux: unknown stream frame type %#x", typ)
 		}
