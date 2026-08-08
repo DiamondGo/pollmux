@@ -39,6 +39,23 @@ type Session struct {
 	// treats meta as effectively immutable post-construction.
 	pollMode string
 
+	// transport is "" or TransportWebSocket, set once by ConnectHandler
+	// alongside pollMode and likewise never mutated after. WebSocketHandler
+	// checks it against TransportWebSocket before accepting an attach, so a
+	// client that fell back to poll-based transport (server had
+	// EnableWebSocket off, or never asked) cannot attach a WebSocket to a
+	// session that was never negotiated for one.
+	transport string
+
+	// wsAttached guards against a session having more than one WebSocket
+	// attached at once: two goroutines both draining toClient via Read would
+	// split traffic unpredictably between two connections. In practice a
+	// session is only ever attached once — ReconnectLoop always calls
+	// Connect for a fresh session id rather than reattaching to an old one —
+	// but WebSocketHandler still checks this defensively rather than
+	// assuming the caller never will.
+	wsAttached atomic.Bool
+
 	// pollInFlight counts long polls currently parked in the handler. A value
 	// above zero means a TCP connection is being held open by this client right
 	// now, so the session is demonstrably alive and must not be evicted — and

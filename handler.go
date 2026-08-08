@@ -24,6 +24,13 @@ const PollModeBatch = "batch"
 // format inside the response body.
 const PollModeStream = "stream"
 
+// TransportWebSocket is ConnectResponse.Transport's value when the server
+// negotiated WebSocket attachment (see ServerConfig.EnableWebSocket and
+// websocket.go). It replaces PollMode/UploadStreamMode's poll/send-stream
+// request pair with a single full-duplex connection, so a session with this
+// transport is never polled — see WebSocketHandler.
+const TransportWebSocket = "websocket"
+
 // ServerConfig holds the server's half of the transport parameters. Every
 // zero-valued field falls back to its documented default.
 //
@@ -75,8 +82,23 @@ type ServerConfig struct {
 	// one. This exists to stay under intermediate proxies' idle/read
 	// timeouts, not for flow control — keep it comfortably below the
 	// tightest timeout in your deployment's path (see README). Ignored
-	// outside stream mode.
+	// outside stream mode. Not used by WebSocket transport (see
+	// EnableWebSocket): a WebSocket connection does not need a forced
+	// rollover to stay under an intermediate proxy's read timeout the way a
+	// long-held HTTP response/request does, because proxies that buffer
+	// ordinary HTTP bodies generally pass WebSocket frames through live —
+	// that asymmetry is the whole reason WebSocket transport exists (see
+	// README's "五、WebSocket 传输模式").
 	StreamMaxDuration time.Duration
+
+	// EnableWebSocket lets ConnectHandler negotiate TransportWebSocket for a
+	// client that sends PreferWebSocket. Independent of PollMode: a server
+	// can offer WebSocket attachment without also offering poll-based stream
+	// mode, and vice versa. A client that does not ask for it, or that talks
+	// to a server with this left false, is completely unaffected — it gets
+	// the existing PollMode/UploadStreamMode negotiation with no visible
+	// difference.
+	EnableWebSocket bool
 
 	// Logger receives diagnostics. Nil disables logging.
 	Logger *slog.Logger
@@ -304,6 +326,20 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 			limitsMode = PollModeStream
 		}
 
+		// Independent of PollMode/UploadStreamMode's own gate (cfg.PollMode):
+		// WebSocket attachment has its own toggle, cfg.EnableWebSocket. It
+		// still rides limitsMode's Heartbeat field (WebSocketHandler uses it
+		// for the app-level heartbeat cadence, see websocket.go) but never
+		// needs StreamMaxDuration — see ServerConfig.StreamMaxDuration.
+		transport := ""
+		if cfg.EnableWebSocket && req.PreferWebSocket {
+			transport = TransportWebSocket
+			if limitsMode != PollModeStream {
+				limitsMode = PollModeStream
+			}
+		}
+		s.transport = transport
+
 		writeJSON(w, http.StatusOK, ConnectResponse{
 			ProtocolVersion:  ProtocolVersion,
 			SessionID:        id,
@@ -311,6 +347,7 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 			Meta:             meta,
 			PollMode:         negotiatedMode,
 			UploadStreamMode: uploadStreamMode,
+			Transport:        transport,
 		})
 	})
 }

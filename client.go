@@ -122,6 +122,18 @@ type Connector struct {
 	// UploadProbeTimeout bounds the auto-detect probe run when
 	// UploadStreamPreference is "". Defaults to DefaultUploadProbeTimeout.
 	UploadProbeTimeout time.Duration
+	// PreferWebSocket asks the server to attach this connection over a
+	// single WebSocket instead of the poll/send-stream request pair
+	// PreferStream/UploadStreamPreference negotiate. Ignored by a server not
+	// configured for it (ServerConfig.EnableWebSocket false) — Connect falls
+	// back to whatever PreferStream/UploadStreamPreference negotiated, with
+	// no error and no visible difference to the caller beyond throughput and
+	// how well the link survives a proxy that buffers long-lived HTTP
+	// bodies (see README's "五、WebSocket 传输模式"). When this is honoured,
+	// UploadStreamPreference and its probe are skipped entirely — a single
+	// WebSocket connection carries both directions, so there is no separate
+	// upload leg to probe.
+	PreferWebSocket bool
 	// Logger receives transport diagnostics. Nil disables logging.
 	Logger *slog.Logger
 }
@@ -177,6 +189,20 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 
 	if err := cr.Limits.Validate(); err != nil {
 		return nil, err
+	}
+
+	// WebSocket is negotiated independently of, and takes priority over, the
+	// PollMode/UploadStreamMode branch below: a session either attaches over
+	// one WebSocket or it doesn't, and if it does none of the poll/
+	// send-stream machinery below is relevant. An old server, or one with
+	// EnableWebSocket off, never sets Transport, so this branch is simply
+	// never taken and every existing caller is unaffected.
+	if cr.Transport == TransportWebSocket {
+		if cr.Limits.HeartbeatIntervalMS <= 0 {
+			return nil, fmt.Errorf("pollmux: server negotiated websocket transport but sent non-positive heartbeat_interval_ms=%d",
+				cr.Limits.HeartbeatIntervalMS)
+		}
+		return c.connectWebSocket(ctx, base, cr, dialTimeout, pollGrace)
 	}
 
 	negotiatedMode := PollModeBatch
@@ -349,6 +375,7 @@ func (c *Connector) doConnect(ctx context.Context, client *http.Client, base str
 		Meta:               c.Meta,
 		PreferStreamMode:   c.PreferStream,
 		PreferStreamUpload: c.UploadStreamPreference != PollModeBatch,
+		PreferWebSocket:    c.PreferWebSocket,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pollmux: failed to encode connect request: %w", err)

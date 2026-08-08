@@ -45,6 +45,13 @@ func newE2EStream(t *testing.T, handle func(net.Conn)) *e2e {
 	return newE2EWithMode(t, handle, PollModeStream)
 }
 
+// newE2EWebSocket is newE2E's WebSocket-transport counterpart: same
+// topology, same helper methods, one WebSocket connection instead of
+// long-poll requests.
+func newE2EWebSocket(t *testing.T, handle func(net.Conn)) *e2e {
+	return newE2EWithMode(t, handle, TransportWebSocket)
+}
+
 func newE2EWithMode(t *testing.T, handle func(net.Conn), mode string) *e2e {
 	t.Helper()
 
@@ -66,12 +73,16 @@ func newE2EWithMode(t *testing.T, handle func(net.Conn), mode string) *e2e {
 			CoalesceWindow: 2 * time.Millisecond,
 			PollBufferSize: 256 << 10,
 			MaxSendBytes:   256 << 10,
-			PollMode:       mode,
 		},
 	}
-	if mode == PollModeStream {
+	switch mode {
+	case PollModeStream:
+		e.cfg.PollMode = mode
 		e.cfg.HeartbeatInterval = 200 * time.Millisecond
 		e.cfg.StreamMaxDuration = 2 * time.Second
+	case TransportWebSocket:
+		e.cfg.EnableWebSocket = true
+		e.cfg.HeartbeatInterval = 200 * time.Millisecond
 	}
 
 	e.hooks = Hooks{
@@ -105,6 +116,7 @@ func newE2EWithMode(t *testing.T, handle func(net.Conn), mode string) *e2e {
 	mux.Handle("POST /tunnel/connect", ConnectHandler(e.store, e.cfg, e.hooks))
 	mux.Handle("POST /tunnel/{id}/poll", PollHandler(e.store, e.cfg, e.hooks))
 	mux.Handle("DELETE /tunnel/{id}", DeleteHandler(e.store, e.cfg, e.hooks))
+	mux.Handle("GET /tunnel/{id}/ws", WebSocketHandler(e.store, e.cfg, e.hooks))
 
 	e.ts = httptest.NewServer(mux)
 	t.Cleanup(e.ts.Close)
@@ -114,7 +126,12 @@ func newE2EWithMode(t *testing.T, handle func(net.Conn), mode string) *e2e {
 // dial brings up a client conn plus its yamux session.
 func (e *e2e) dial(t *testing.T) (Conn, *yamux.Session) {
 	t.Helper()
-	c := &Connector{BaseURL: e.ts.URL, PollGrace: 2 * time.Second, PreferStream: e.pollMode == PollModeStream}
+	c := &Connector{
+		BaseURL:         e.ts.URL,
+		PollGrace:       2 * time.Second,
+		PreferStream:    e.pollMode == PollModeStream,
+		PreferWebSocket: e.pollMode == TransportWebSocket,
+	}
 	conn, err := c.Connect(context.Background())
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
@@ -141,8 +158,9 @@ func (e *e2e) reasons() []DisconnectReason {
 
 // Megabytes through the whole stack, compared by hash. Everything else in this
 // library is in service of this working.
-func TestE2EByteFidelity(t *testing.T)        { testE2EByteFidelity(t, newE2E(t, nil)) }
-func TestE2EByteFidelity_Stream(t *testing.T) { testE2EByteFidelity(t, newE2EStream(t, nil)) }
+func TestE2EByteFidelity(t *testing.T)           { testE2EByteFidelity(t, newE2E(t, nil)) }
+func TestE2EByteFidelity_Stream(t *testing.T)    { testE2EByteFidelity(t, newE2EStream(t, nil)) }
+func TestE2EByteFidelity_WebSocket(t *testing.T) { testE2EByteFidelity(t, newE2EWebSocket(t, nil)) }
 
 func testE2EByteFidelity(t *testing.T, e *e2e) {
 	_, sess := e.dial(t)
@@ -196,6 +214,9 @@ func TestE2EConcurrentStreamsAreNotSerialized(t *testing.T) {
 }
 func TestE2EConcurrentStreamsAreNotSerialized_Stream(t *testing.T) {
 	testE2EConcurrentStreamsAreNotSerialized(t, func(handle func(net.Conn)) *e2e { return newE2EStream(t, handle) })
+}
+func TestE2EConcurrentStreamsAreNotSerialized_WebSocket(t *testing.T) {
+	testE2EConcurrentStreamsAreNotSerialized(t, func(handle func(net.Conn)) *e2e { return newE2EWebSocket(t, handle) })
 }
 
 func testE2EConcurrentStreamsAreNotSerialized(t *testing.T, build func(func(net.Conn)) *e2e) {
@@ -257,6 +278,9 @@ func TestE2EBidirectionalTraffic(t *testing.T) {
 func TestE2EBidirectionalTraffic_Stream(t *testing.T) {
 	testE2EBidirectionalTraffic(t, func(handle func(net.Conn)) *e2e { return newE2EStream(t, handle) })
 }
+func TestE2EBidirectionalTraffic_WebSocket(t *testing.T) {
+	testE2EBidirectionalTraffic(t, func(handle func(net.Conn)) *e2e { return newE2EWebSocket(t, handle) })
+}
 
 func testE2EBidirectionalTraffic(t *testing.T, build func(func(net.Conn)) *e2e) {
 	e := build(func(stream net.Conn) {
@@ -299,6 +323,9 @@ func TestE2EServerCloseIsNoticedPromptly(t *testing.T) {
 }
 func TestE2EServerCloseIsNoticedPromptly_Stream(t *testing.T) {
 	testE2EServerCloseIsNoticedPromptly(t, newE2EStream(t, nil))
+}
+func TestE2EServerCloseIsNoticedPromptly_WebSocket(t *testing.T) {
+	testE2EServerCloseIsNoticedPromptly(t, newE2EWebSocket(t, nil))
 }
 
 func testE2EServerCloseIsNoticedPromptly(t *testing.T, e *e2e) {
@@ -412,9 +439,17 @@ func TestE2ECleanDisconnect(t *testing.T) {
 func TestE2ECleanDisconnect_Stream(t *testing.T) {
 	testE2ECleanDisconnect(t, newE2EStream(t, nil))
 }
+func TestE2ECleanDisconnect_WebSocket(t *testing.T) {
+	testE2ECleanDisconnect(t, newE2EWebSocket(t, nil))
+}
 
 func testE2ECleanDisconnect(t *testing.T, e *e2e) {
-	c := &Connector{BaseURL: e.ts.URL, PollGrace: 2 * time.Second, PreferStream: e.pollMode == PollModeStream}
+	c := &Connector{
+		BaseURL:         e.ts.URL,
+		PollGrace:       2 * time.Second,
+		PreferStream:    e.pollMode == PollModeStream,
+		PreferWebSocket: e.pollMode == TransportWebSocket,
+	}
 	conn, err := c.Connect(context.Background())
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
@@ -438,6 +473,9 @@ func TestE2EReconnectLoopRecoversFromServerClose(t *testing.T) {
 func TestE2EReconnectLoopRecoversFromServerClose_Stream(t *testing.T) {
 	testE2EReconnectLoopRecoversFromServerClose(t, newE2EStream(t, nil))
 }
+func TestE2EReconnectLoopRecoversFromServerClose_WebSocket(t *testing.T) {
+	testE2EReconnectLoopRecoversFromServerClose(t, newE2EWebSocket(t, nil))
+}
 
 func testE2EReconnectLoopRecoversFromServerClose(t *testing.T, e *e2e) {
 	sessionIDs := make(chan string, 4)
@@ -446,7 +484,12 @@ func testE2EReconnectLoopRecoversFromServerClose(t *testing.T, e *e2e) {
 
 	loop := &ReconnectLoop{
 		Connect: func(ctx context.Context) (Conn, error) {
-			c := &Connector{BaseURL: e.ts.URL, PollGrace: 2 * time.Second, PreferStream: e.pollMode == PollModeStream}
+			c := &Connector{
+				BaseURL:         e.ts.URL,
+				PollGrace:       2 * time.Second,
+				PreferStream:    e.pollMode == PollModeStream,
+				PreferWebSocket: e.pollMode == TransportWebSocket,
+			}
 			return c.Connect(ctx)
 		},
 		Serve: func(ctx context.Context, conn Conn) Outcome {

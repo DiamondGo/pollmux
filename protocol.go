@@ -135,6 +135,15 @@ type ConnectRequest struct {
 	// download-only stream mode degrades cleanly instead of sending
 	// HeaderSendStream requests the server has never heard of.
 	PreferStreamUpload bool `json:"prefer_stream_upload,omitempty"`
+	// PreferWebSocket asks the server to attach this session over a single
+	// WebSocket connection (see ConnectResponse.Transport) instead of the
+	// poll/send-stream request pair PreferStreamMode/PreferStreamUpload
+	// negotiate. Independent of both of those on the wire — gated by its own
+	// ServerConfig.EnableWebSocket, not ServerConfig.PollMode — so an old
+	// server that has never heard of this field simply never sets
+	// ConnectResponse.Transport and the client falls back to whatever
+	// PreferStreamMode/PreferStreamUpload negotiated, unchanged.
+	PreferWebSocket bool `json:"prefer_websocket,omitempty"`
 }
 
 // Limits are the transport parameters the server hands down at connect time.
@@ -213,6 +222,13 @@ type ConnectResponse struct {
 	// field means. A client must treat empty the same as PollModeBatch: fall
 	// back to the discrete writeBuf/flushLoop send path.
 	UploadStreamMode string `json:"upload_stream_mode,omitempty"`
+	// Transport is TransportWebSocket when the server negotiated a WebSocket
+	// attachment for this session (see ConnectRequest.PreferWebSocket), empty
+	// otherwise — including when talking to an older server that predates
+	// WebSocket support. A client must treat empty as "use PollMode/
+	// UploadStreamMode as negotiated above", never as an error: this field is
+	// purely additive over the existing negotiation.
+	Transport string `json:"transport,omitempty"`
 }
 
 // errorResponse is the JSON body of any non-2xx answer from the handlers.

@@ -95,6 +95,24 @@ batch 模式下行的含义要算一下：`poll_buffer_bytes` 默认 256KB，在
 
 三态里显式配置的两种（`batch`/`stream`）总是零延迟；只有默认的自动档会在每次 `Connect` 上多付出一次探测的时间成本（成功时通常几毫秒，失败时最多 `UploadProbeTimeout`）。
 
+### 五、WebSocket 传输模式
+
+上面两节解决的是"轮询本身有 RTT 瓶颈"；WebSocket 传输模式解决的是另一个、更根本的问题：**有些中间代理对普通 HTTP 干脆不支持真正的双向流式转发**。
+
+生产环境复现过这个故事的两半：一开始怀疑只有上行（长驻 chunked 请求体）会被 Cloudflare 标准套餐整体缓冲（见上一节），于是给上行加了连接期自动探测。但探测用的是一次性、无间隔的大块灌包，和真实隧道流量"长时间打开、数据一阵一阵地来、中间有大段空档"的模式并不一样——探测通过之后，真实流量在同一条链路上还是会挂死，且没有任何报错，双端日志只看到会话每隔几十秒静默重连一次。用一个独立 endpoint 做对照实验（同一个 broker、同一条 Cloudflare 链路，只切 `upload_stream_preference`）确认了这一点：自动档下 9/9 请求全部超时，强制 `"batch"` 下 6/6 请求全部在一秒内成功。换句话说，探测这道防线本身是不可靠的，问题也不是只出在上行方向的字节数上，而是这条链路对"长时间保持打开、间歇性写入"这种模式本身处理有问题。
+
+WebSocket 是绕开这个问题的正确层：Cloudflare（以及几乎所有反向代理）对 WebSocket 连接是逐帧透传的，不会像对付一个长驻 HTTP 请求体那样整体缓冲——这是 WebSocket 协议本身的地位决定的，不依赖套餐等级或额外配置。
+
+**开启方式**：服务端 `ServerConfig.EnableWebSocket = true`，客户端 `Connector.PreferWebSocket = true`。协商独立于 `PollMode`/`UploadStreamPreference`（各自的 wire 字段是 `ConnectRequest.PreferWebSocket` / `ConnectResponse.Transport`），网关不支持时静默降级到 `PollMode`/`UploadStreamPreference` 已经谈好的结果，旧版本双方完全无感知——这条路径是纯新增的，不修改、不复用批量/流式轮询的任何现有代码路径。
+
+**这不是轮询的第三个模式，是轮询的替代品**：协商到 `Transport = "websocket"` 的会话，客户端不再发 `/connect` 之外的任何 POST 请求，而是对 `{prefix}/{id}/ws` 发起一次 WebSocket 升级，之后两个方向的数据都在这一条连接上收发，直到会话结束。`PollHandler`/`pollLoop`/`pollLoopStream`/`sendLoopStream` 这些既有代码路径完全不参与——一个会话要么走轮询（batch 或 stream 二选一），要么走 WebSocket，不会混用。
+
+**帧格式复用，但只用得到一半**：WebSocket 连接上的每条消息是一个字节的类型标签（复用 `frame.go` 的 `frameType`）加payload，`frameData` 传数据、`frameHeartbeat` 传心跳——WebSocket 本身自带消息边界，所以不需要 `frame.go` 那套用于 HTTP chunked body 的长度前缀。`frameEnd`/`frameGone` 在这条路径上没有对应物：WebSocket 有自己原生的关闭握手，"这个会话结束了"直接体现为把连接关掉（干净关闭还是异常关闭，客户端一律当传输失败处理并重连——和 `frameGone` 今天的语义一致，`OutcomePeerClosed` vs `OutcomeTransportFailed` 的判断权在更上层，不需要靠帧类型区分）。
+
+**心跳与存活检测复用 `HeartbeatInterval`，但没有 `StreamMaxDuration`**：`ServerConfig.HeartbeatInterval` 照旧决定"空闲多久发一次心跳帧"，两端各自的读空闲看门狗都是 `HeartbeatInterval + 宽限`（服务端侧宽限沿用内部的 `defaultStreamReadGrace`，客户端侧沿用 `Connector.PollGrace`，和流式轮询的看门狗是同一套参数、同一个量级）。但 `StreamMaxDuration`（流式轮询里"一条长驻响应最长开多久，到点强制轮转"那个参数）在这条路径上完全用不上——它存在的理由是"避开中间代理自己的 idle/read 超时"，而 WebSocket 连接不需要靠周期性重开来避开这类超时，只要心跳按时发，一条连接可以一直开着。
+
+**依赖**：`go.mod` 新增 `github.com/coder/websocket`。选它是因为 API 是 context-native 的（`Read(ctx)`/`Write(ctx, ...)`），和这个库本身大量用 context 做超时/取消的风格一致；没有引入额外的传递依赖。
+
 ---
 
 ## 协议与行为约定
@@ -120,9 +138,11 @@ batch 模式下行的含义要算一下：`poll_buffer_bytes` 默认 256KB，在
 
 流式模式不引入新状态码——上面这张表在 `PollMode = "stream"` 下原样适用（410、413 等语义不变），分帧发生在响应体内部，是应用层的事，不需要 HTTP 层再表达一次。
 
+WebSocket 传输模式用的是升级请求本身的状态码，和上面这张表是两套独立的错误面：404（会话不存在）、400（会话没有协商 WebSocket 传输，例如客户端连错了 endpoint 或服务端 `EnableWebSocket` 中途被关掉）、409（会话已经有一条 WebSocket 挂着，正常运行下不会触发——见下方"这不是轮询的第三个模式"）。协商阶段的握手（`/connect`）仍然走上面那张表。
+
 ### 参数下发
 
-需要两端一致的数字由服务端做权威并在 connect 时下发（`max_send_bytes`、`poll_timeout`、`session_timeout`、`poll_buffer_bytes`，流式模式下再加 `heartbeat_interval_ms`、`stream_max_duration_ms`），客户端只能更保守，不能更激进。这与 HTTP/2 的 SETTINGS、TCP 的 MSS 协商是同一个道理：**不要两边各配一份**。
+需要两端一致的数字由服务端做权威并在 connect 时下发（`max_send_bytes`、`poll_timeout`、`session_timeout`、`poll_buffer_bytes`，流式模式或 WebSocket 传输下再加 `heartbeat_interval_ms`）。WebSocket 传输协商时 `stream_max_duration_ms` 也会跟着一起下发（内部复用了流式轮询同一套"这次 connect 要不要带上 Heartbeat/StreamMaxDuration"的判断），但 WebSocket 的客户端/服务端实现都不读它——上一节已经说明这条路径不需要强制轮转。客户端只能更保守，不能更激进。这与 HTTP/2 的 SETTINGS、TCP 的 MSS 协商是同一个道理：**不要两边各配一份**。
 
 客户端在 connect 时还会自检 —— 如果 `poll_timeout + PollInterval >= session_timeout`，说明这个客户端健康时也会被服务端当成掉线扫掉，于是直接返回错误而不是带着这个隐患跑起来。
 

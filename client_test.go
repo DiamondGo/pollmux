@@ -46,6 +46,8 @@ type fakeServer struct {
 	sendStreamGone   bool // if true, every send-stream request answers 410
 	sendStreamHang   bool // if true, every send-stream request (including probes) never answers until the request context ends
 
+	websocketMode bool // if true, connect negotiates websocket transport when asked; heartbeatMS still governs its Limits
+
 	mu                 sync.Mutex
 	sends              [][]byte
 	sendHdrs           []http.Header
@@ -140,6 +142,10 @@ func (f *fakeServer) serveConnect(w http.ResponseWriter, r *http.Request) {
 		resp.UploadStreamMode = PollModeStream
 		resp.Limits.HeartbeatIntervalMS = f.heartbeatMS
 		resp.Limits.StreamMaxDurationMS = f.streamMaxMS
+	}
+	if f.websocketMode && req.PreferWebSocket {
+		resp.Transport = TransportWebSocket
+		resp.Limits.HeartbeatIntervalMS = f.heartbeatMS
 	}
 
 	w.Header().Set("Content-Type", "application/json")
