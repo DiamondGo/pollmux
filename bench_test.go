@@ -100,3 +100,82 @@ func BenchmarkThroughput_Batch_150msRTT(b *testing.B) {
 func BenchmarkThroughput_Stream_150msRTT(b *testing.B) {
 	benchmarkThroughput(b, PollModeStream, 150*time.Millisecond, 8)
 }
+
+// benchmarkUploadThroughput mirrors benchmarkThroughput but drives data the
+// other way: conn.Write() (client -> server) instead of s.Write() (server ->
+// client). This is what caught the gap the upload-streaming design fixes:
+// batch and stream measured within noise of each other until PollModeStream
+// grew a real send-stream path (see DESIGN.md's "背景" section for the
+// numbers that motivated it).
+func benchmarkUploadThroughput(b *testing.B, mode string, rtt time.Duration, payloadMB int) {
+	st := NewSessionStore()
+	cfg := ServerConfig{
+		PollTimeout:    2 * time.Second,
+		SessionTimeout: 10 * time.Second,
+		SweepInterval:  time.Second,
+		PollMode:       mode,
+	}
+	if mode == PollModeStream {
+		cfg.HeartbeatInterval = 500 * time.Millisecond
+		cfg.StreamMaxDuration = 30 * time.Second
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("POST /tunnel/connect", ConnectHandler(st, cfg, Hooks{}))
+	mux.Handle("POST /tunnel/{id}/poll", withArtificialDelay(PollHandler(st, cfg, Hooks{}), rtt))
+	mux.Handle("DELETE /tunnel/{id}", DeleteHandler(st, cfg, Hooks{}))
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	c := &Connector{BaseURL: ts.URL, PollGrace: 5 * time.Second, SendTimeout: 30 * time.Second, PreferStream: mode == PollModeStream}
+	conn, err := c.Connect(context.Background())
+	if err != nil {
+		b.Fatalf("Connect: %v", err)
+	}
+	defer conn.Close()
+
+	s, ok := st.Get(conn.SessionID())
+	if !ok {
+		b.Fatal("session not found on server after connect")
+	}
+
+	payload := make([]byte, payloadMB<<20)
+	rand.Read(payload)
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64<<10)
+		total := 0
+		for total < len(payload) {
+			n, err := s.Read(buf)
+			if err != nil {
+				done <- err
+				return
+			}
+			total += n
+		}
+		done <- nil
+	}()
+
+	b.ResetTimer()
+	start := time.Now()
+
+	if _, err := conn.Write(payload); err != nil {
+		b.Fatalf("Write: %v", err)
+	}
+	if err := <-done; err != nil {
+		b.Fatalf("Read: %v", err)
+	}
+
+	elapsed := time.Since(start)
+	b.StopTimer()
+	b.ReportMetric(float64(len(payload))/(1<<20)/elapsed.Seconds(), "MB/s")
+}
+
+func BenchmarkUploadThroughput_Batch_150msRTT(b *testing.B) {
+	benchmarkUploadThroughput(b, PollModeBatch, 150*time.Millisecond, 8)
+}
+
+func BenchmarkUploadThroughput_Stream_150msRTT(b *testing.B) {
+	benchmarkUploadThroughput(b, PollModeStream, 150*time.Millisecond, 8)
+}

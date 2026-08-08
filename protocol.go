@@ -31,6 +31,11 @@ const (
 	// HeaderLocalHealth is an optional piggybacked report ("ok" or "down")
 	// handed to Hooks.OnPoll. The library itself does not interpret it.
 	HeaderLocalHealth = "X-Local-Health"
+	// HeaderSendStream marks an upload-stream request: the body is a sequence
+	// of frames (see frame.go), written continuously as data becomes
+	// available and read continuously by the server, instead of one discrete
+	// chunk per request. Mutually exclusive with HeaderSendOnly.
+	HeaderSendStream = "X-Send-Stream"
 )
 
 // Server-side defaults. See ServerConfig.
@@ -42,12 +47,22 @@ const (
 	DefaultMaxSendBytes   = 1 << 20
 
 	// DefaultHeartbeatInterval and DefaultStreamMaxDuration only apply when
-	// ServerConfig.PollMode == PollModeStream.
+	// ServerConfig.PollMode == PollModeStream. Both are shared verbatim by
+	// the upload direction (see ConnectRequest.PreferStreamUpload) — there is
+	// no separate upload-specific pair of knobs.
 	DefaultHeartbeatInterval = 10 * time.Second
 	// DefaultStreamMaxDuration is kept comfortably under common intermediate
 	// proxy read/idle timeouts (a 60s timeout is common; sitting right on top
 	// of it leaves no margin), not just under SessionTimeout.
 	DefaultStreamMaxDuration = 45 * time.Second
+
+	// defaultStreamReadGrace is the server's local safety margin for the
+	// upload-stream read-idle watchdog (PollHandler's pollSendStream): if no
+	// frame — data or heartbeat — arrives within HeartbeatInterval plus this
+	// much slack, the server gives up on the request. Unlike PollGrace this
+	// never needs to match anything the client declares, so it stays an
+	// unexported constant rather than a Limits field.
+	defaultStreamReadGrace = 10 * time.Second
 )
 
 // Client-side defaults. See Connector.
@@ -87,6 +102,14 @@ type ConnectRequest struct {
 	// ServerConfig.PollMode is PollModeStream — the server is always the
 	// authority on what it supports.
 	PreferStreamMode bool `json:"prefer_stream_mode,omitempty"`
+	// PreferStreamUpload asks the server to also negotiate streamed uploads
+	// (see ConnectResponse.UploadStreamMode). Negotiated independently of
+	// PreferStreamMode on the wire — same server-side gate
+	// (ServerConfig.PollMode == PollModeStream), but a separate field — so
+	// that a new client talking to a server that only understands the older
+	// download-only stream mode degrades cleanly instead of sending
+	// HeaderSendStream requests the server has never heard of.
+	PreferStreamUpload bool `json:"prefer_stream_upload,omitempty"`
 }
 
 // Limits are the transport parameters the server hands down at connect time.
@@ -158,6 +181,13 @@ type ConnectResponse struct {
 	// doesn't know this field) means batch — new clients must treat an
 	// empty/unrecognized value as batch, never as an error.
 	PollMode string `json:"poll_mode,omitempty"`
+	// UploadStreamMode is PollModeStream when the server also negotiated
+	// streamed uploads for this session (see ConnectRequest.
+	// PreferStreamUpload), empty otherwise — including when talking to an
+	// older server that predates upload streaming and has no idea what this
+	// field means. A client must treat empty the same as PollModeBatch: fall
+	// back to the discrete writeBuf/flushLoop send path.
+	UploadStreamMode string `json:"upload_stream_mode,omitempty"`
 }
 
 // errorResponse is the JSON body of any non-2xx answer from the handlers.

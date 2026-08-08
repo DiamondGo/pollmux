@@ -42,12 +42,17 @@ type fakeServer struct {
 	streamPush  chan frameMsg // frames to write on the next stream poll
 	streamHang  bool          // if true, write headers then never push/close (watchdog test)
 
-	mu       sync.Mutex
-	sends    [][]byte
-	sendHdrs []http.Header
-	pollHdrs []http.Header
-	deletes  []string
-	connects []ConnectRequest
+	uploadStreamMode bool // if true, connect negotiates upload streaming when asked
+	sendStreamGone   bool // if true, every send-stream request answers 410
+
+	mu                 sync.Mutex
+	sends              [][]byte
+	sendHdrs           []http.Header
+	pollHdrs           []http.Header
+	deletes            []string
+	connects           []ConnectRequest
+	streamSends        [][]byte // frameData payloads received across all send-stream requests, in order
+	sendStreamRequests int      // how many separate X-Send-Stream requests were opened
 }
 
 // frameMsg is one entry fed through fakeServer.streamPush: a frame the fake
@@ -130,6 +135,11 @@ func (f *fakeServer) serveConnect(w http.ResponseWriter, r *http.Request) {
 		resp.Limits.HeartbeatIntervalMS = f.heartbeatMS
 		resp.Limits.StreamMaxDurationMS = f.streamMaxMS
 	}
+	if f.uploadStreamMode && req.PreferStreamUpload {
+		resp.UploadStreamMode = PollModeStream
+		resp.Limits.HeartbeatIntervalMS = f.heartbeatMS
+		resp.Limits.StreamMaxDurationMS = f.streamMaxMS
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -137,6 +147,10 @@ func (f *fakeServer) serveConnect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fakeServer) servePoll(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get(HeaderSendStream) == "true" {
+		f.serveSendStream(w, r)
+		return
+	}
 	if r.Header.Get(HeaderSendOnly) == "true" {
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
@@ -208,6 +222,49 @@ func (f *fakeServer) serveStreamPoll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// serveSendStream mirrors pollSendStream's contract closely enough to
+// exercise the client's doSendStream/feedSendStream against the same frame
+// protocol the real handler speaks, without depending on pollSendStream
+// itself (see the fakeServer doc comment above).
+func (f *fakeServer) serveSendStream(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.sendStreamRequests++
+	gone := f.sendStreamGone
+	f.mu.Unlock()
+
+	if gone {
+		w.WriteHeader(http.StatusGone)
+		return
+	}
+
+	fr := newFrameReader(r.Body, 1<<20)
+	for {
+		typ, payload, err := fr.next()
+		if err != nil {
+			return // mid-frame/network error: drop the connection, same as pollSendStream
+		}
+		switch typ {
+		case frameData:
+			f.mu.Lock()
+			f.streamSends = append(f.streamSends, append([]byte(nil), payload...))
+			f.mu.Unlock()
+		case frameHeartbeat:
+			// nothing to record
+		case frameEnd:
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}
+}
+
+func (f *fakeServer) allStreamSends() [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]byte, len(f.streamSends))
+	copy(out, f.streamSends)
+	return out
 }
 
 func (f *fakeServer) sentBodies() [][]byte {
@@ -1129,5 +1186,152 @@ func TestClientStreamModeFallsBackToDefaultFrameSizeWhenServerOmitsPollBufferByt
 	}
 	if string(buf[:n]) != "still works" {
 		t.Fatalf("Read = %q, want %q", buf[:n], "still works")
+	}
+}
+
+// --- upload streaming ---------------------------------------------------------
+
+func TestUploadStreamWritesArriveWithoutRequestEnding(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.uploadStreamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	if _, err := conn.Write([]byte("hello upload")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	waitFor(t, time.Second, func() bool { return len(f.allStreamSends()) == 1 })
+	if got := f.allStreamSends()[0]; string(got) != "hello upload" {
+		t.Fatalf("streamSends[0] = %q, want %q", got, "hello upload")
+	}
+	// Must have gone out on the send-stream path, not the old discrete one.
+	if n := len(f.sentBodies()); n != 0 {
+		t.Fatalf("sentBodies (batch path) = %d, want 0 — this session negotiated upload streaming", n)
+	}
+}
+
+// TestUploadStreamRotatesAtStreamMaxDuration is the regression test for
+// "who decides the rollover" (see DESIGN.md): a short StreamMaxDuration must
+// force feedSendStream to open several requests over time, and every byte
+// written across all of them must still arrive, in order, none dropped at a
+// rollover boundary.
+func TestUploadStreamRotatesAtStreamMaxDuration(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.uploadStreamMode = true
+	f.heartbeatMS = 20
+	f.streamMaxMS = 60 // short enough to force several rollovers quickly
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	want := [][]byte{[]byte("one"), []byte("two"), []byte("three")}
+	for _, chunk := range want {
+		if _, err := conn.Write(chunk); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		// Longer than StreamMaxDuration: guarantees a rollover happens
+		// between this write and the next.
+		time.Sleep(120 * time.Millisecond)
+	}
+
+	waitFor(t, 2*time.Second, func() bool { return len(f.allStreamSends()) == len(want) })
+	got := f.allStreamSends()
+	for i := range want {
+		if string(got[i]) != string(want[i]) {
+			t.Fatalf("streamSends[%d] = %q, want %q — a rollover must not drop or reorder data", i, got[i], want[i])
+		}
+	}
+
+	f.mu.Lock()
+	n := f.sendStreamRequests
+	f.mu.Unlock()
+	if n < 2 {
+		t.Fatalf("sendStreamRequests = %d, want at least 2 — StreamMaxDuration should have forced a rollover", n)
+	}
+}
+
+func TestUploadStreamFallsBackToBatchWhenServerDoesNotOfferIt(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true        // download stream still offered
+	f.uploadStreamMode = false // upload streaming is not
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	if _, err := conn.Write([]byte("batch path")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	waitFor(t, time.Second, func() bool { return len(f.sentBodies()) == 1 })
+	if got := f.sentBodies()[0]; string(got) != "batch path" {
+		t.Fatalf("sentBodies[0] = %q, want %q", got, "batch path")
+	}
+	if n := len(f.allStreamSends()); n != 0 {
+		t.Fatalf("streamSends = %d, want 0 — the server never offered upload streaming for this session", n)
+	}
+}
+
+// TestUploadStreamTreatsGoneAsTransportFailure exercises doSendStream's own
+// 410 handling directly — a fake server that answers Gone without reading the
+// body at all. In production this path is a backstop, not the primary
+// detector (see DESIGN.md's "存活性" section: the download leg's frameGone
+// normally notices a closed session first, via the shared c.ctx). Standalone,
+// feedSendStream only discovers pw is broken the next time it tries to write
+// to it — at the next heartbeat — so heartbeatMS has to be short here for the
+// failure to surface within the test's timeout; a long production
+// HeartbeatInterval just means this backstop path is correspondingly slower,
+// which is the documented, accepted tradeoff.
+func TestUploadStreamTreatsGoneAsTransportFailure(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.uploadStreamMode = true
+	f.heartbeatMS = 30
+	f.streamMaxMS = 5000
+	f.sendStreamGone = true
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	conn.Write([]byte("into the void"))
+
+	select {
+	case <-conn.TransportFailed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("a 410 on the send-stream request must be treated as a transport failure, the same role it plays elsewhere")
+	}
+}
+
+// TestUploadStreamCloseIsPrompt mirrors TestCloseIsPromptDuringLongStreamPoll
+// for the write side: Close must not wait out HeartbeatInterval or
+// StreamMaxDuration just because feedSendStream is parked in ReadAvailable.
+func TestUploadStreamCloseIsPrompt(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.uploadStreamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000 // long — Close must not wait anywhere near this out
+
+	c := f.connector()
+	c.PreferStream = true
+	conn := mustConnect(t, c)
+
+	start := time.Now()
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Close took %v, should not wait out HeartbeatInterval/StreamMaxDuration", elapsed)
 	}
 }

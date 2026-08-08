@@ -159,6 +159,12 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 	negotiatedMode := PollModeBatch
 	if cr.PollMode == PollModeStream {
 		negotiatedMode = PollModeStream
+	}
+	// Negotiated independently of negotiatedMode on the wire (see DESIGN.md),
+	// but both need the same Heartbeat/StreamMaxDuration limits, so the
+	// validation below fires whenever either one is stream.
+	negotiatedUpload := cr.UploadStreamMode == PollModeStream
+	if negotiatedMode == PollModeStream || negotiatedUpload {
 		if cr.Limits.HeartbeatIntervalMS <= 0 {
 			return nil, fmt.Errorf("pollmux: server negotiated stream mode but sent non-positive heartbeat_interval_ms=%d",
 				cr.Limits.HeartbeatIntervalMS)
@@ -228,6 +234,19 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 		streamMode:        negotiatedMode == PollModeStream,
 		streamIdleTimeout: cr.Limits.HeartbeatInterval() + pollGrace,
 		streamMaxFrame:    orInt(cr.Limits.PollBufferBytes, DefaultPollBufferSize),
+
+		uploadStreamMode: negotiatedUpload,
+	}
+
+	if negotiatedUpload {
+		// The response to a send-stream request only arrives once the whole
+		// request ends (StreamMaxDuration rollover or the connection closing),
+		// so — unlike sendClient's short SendTimeout for a discrete send —
+		// this transport's ResponseHeaderTimeout has to cover a whole stream
+		// leg, the same reasoning as pollTransport's batch-mode branch above.
+		sendStreamTransport := c.newTransport(dialTimeout, cr.Limits.StreamMaxDuration()+pollGrace)
+		conn.sendStreamClient = &http.Client{Transport: sendStreamTransport, CheckRedirect: noRedirect}
+		conn.writePipe = NewBufferedPipe()
 	}
 
 	logger.Debug("pollmux: connected",
@@ -236,6 +255,7 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 		"session_timeout", cr.Limits.SessionTimeout(),
 		"poll_buffer_bytes", cr.Limits.PollBufferBytes,
 		"poll_mode", negotiatedMode,
+		"upload_stream_mode", negotiatedUpload,
 	)
 
 	conn.wg.Add(1)
@@ -243,6 +263,11 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 		go conn.pollLoopStream()
 	} else {
 		go conn.pollLoop()
+	}
+
+	if conn.uploadStreamMode {
+		conn.wg.Add(1)
+		go conn.sendLoopStream()
 	}
 
 	return conn, nil
@@ -270,9 +295,10 @@ func (c *Connector) newTransport(dialTimeout, responseHeaderTimeout time.Duratio
 // doConnect performs POST {prefix}/connect and parses the response.
 func (c *Connector) doConnect(ctx context.Context, client *http.Client, base string) (*ConnectResponse, error) {
 	body, err := json.Marshal(ConnectRequest{
-		ProtocolVersion:  ProtocolVersion,
-		Meta:             c.Meta,
-		PreferStreamMode: c.PreferStream,
+		ProtocolVersion:    ProtocolVersion,
+		Meta:               c.Meta,
+		PreferStreamMode:   c.PreferStream,
+		PreferStreamUpload: c.PreferStream,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pollmux: failed to encode connect request: %w", err)
@@ -341,8 +367,9 @@ type httpConn struct {
 	deleteURL string
 	authToken string
 
-	pollClient *http.Client
-	sendClient *http.Client
+	pollClient       *http.Client
+	sendClient       *http.Client
+	sendStreamClient *http.Client // only set when uploadStreamMode is true
 
 	limits Limits
 	meta   map[string]string
@@ -371,13 +398,23 @@ type httpConn struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	// Write-side coalescing. yamux issues a frame's header and body as two
-	// back-to-back writes, and under load many frames queue up while a previous
-	// send is in flight. One HTTP request per write is fine on a local link but
+	// Write-side coalescing for the batch write path (uploadStreamMode ==
+	// false). yamux issues a frame's header and body as two back-to-back
+	// writes, and under load many frames queue up while a previous send is
+	// in flight. One HTTP request per write is fine on a local link but
 	// turns every tiny write into a full round trip over real RTT.
 	writeMu       sync.Mutex
 	writeBuf      []byte
 	writeFlightOn bool
+
+	// uploadStreamMode and writePipe drive the upload-stream write path
+	// instead: Write() pushes into writePipe (a BufferedPipe, same primitive
+	// the server already uses for the download direction — see DESIGN.md's
+	// "关键洞察") and sendLoopStream continuously drains it into one
+	// long-lived POST body at a time, only set up when the server negotiated
+	// it. writeMu/writeBuf/writeFlightOn above are unused in this mode.
+	uploadStreamMode bool
+	writePipe        *BufferedPipe
 }
 
 func (c *httpConn) SessionID() string { return c.sessionID }
@@ -411,6 +448,10 @@ func (c *httpConn) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 
+	if c.uploadStreamMode {
+		return c.writePipe.Write(p)
+	}
+
 	c.writeMu.Lock()
 	c.writeBuf = append(c.writeBuf, p...)
 	if c.writeFlightOn {
@@ -435,6 +476,12 @@ func (c *httpConn) Close() error {
 	// Cancelling aborts the poll request in flight. Without this, Close would
 	// block until the current long poll returned — up to a full poll timeout.
 	c.cancel()
+	if c.writePipe != nil {
+		// Unblocks a feedSendStream parked in ReadAvailable so
+		// sendLoopStream's current doSendStream call can wind down and the
+		// goroutine c.wg.Wait() below is waiting on can exit.
+		c.writePipe.Close()
+	}
 	c.wg.Wait()
 	c.readPipe.Close()
 
@@ -778,6 +825,116 @@ func (c *httpConn) doSend(chunk []byte) error {
 		return &fatalPollError{status: resp.StatusCode, detail: "protocol violation"}
 	default:
 		return &fatalPollError{status: resp.StatusCode}
+	}
+}
+
+// sendLoopStream is flushLoop's upload-stream counterpart: instead of one
+// discrete send-only request per chunk, it holds one long-lived POST body
+// open at a time and feeds it frames as writePipe accumulates data, reopening
+// a new request only when doSendStream ends cleanly (a client-decided
+// rollover, or writePipe closing because Close() was called).
+func (c *httpConn) sendLoopStream() {
+	defer c.wg.Done()
+	for {
+		if c.ctx.Err() != nil {
+			return
+		}
+
+		if err := c.doSendStream(); err != nil {
+			if c.ctx.Err() != nil || c.closed.Load() {
+				return // deliberate shutdown, not a failure
+			}
+			c.logger.Warn("pollmux: send-stream failed, signalling transport failure", "error", err)
+			c.fail()
+			return
+		}
+		// nil error: a clean, client-decided rollover. Open the next request
+		// immediately, the same spirit as pollLoopStream reopening after
+		// errStreamEnd.
+	}
+}
+
+// doSendStream opens one send-stream POST, whose body is fed by
+// feedSendStream running concurrently, and waits for the server's response.
+// The server only answers once the request body ends (see pollSendStream),
+// so this call's lifetime is bounded by whatever feedSendStream decides —
+// normally one StreamMaxDuration-ish leg.
+func (c *httpConn) doSendStream() error {
+	pr, pw := io.Pipe()
+	feedErrCh := make(chan error, 1)
+	go func() { feedErrCh <- c.feedSendStream(pw) }()
+
+	req, err := http.NewRequestWithContext(c.ctx, http.MethodPost, c.pollURL, pr)
+	if err != nil {
+		pw.CloseWithError(err)
+		<-feedErrCh
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set(HeaderSendStream, "true")
+	// Chunked transfer encoding, since the body's total length is not known
+	// upfront — the same reason pollStream's response on the server side
+	// carries no Content-Length either.
+	req.ContentLength = -1
+	c.setAuth(req)
+
+	resp, err := c.sendStreamClient.Do(req)
+	feedErr := <-feedErrCh // feedSendStream always returns once pw is closed one way or another
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return feedErr // nil on a clean rollover; non-nil only if the local feeder itself failed
+	case http.StatusGone:
+		return &fatalPollError{status: resp.StatusCode, detail: "session closed by server"}
+	default:
+		return &fatalPollError{status: resp.StatusCode}
+	}
+}
+
+// feedSendStream drains writePipe into pw as a sequence of frames until it
+// decides to end this leg — either a clean StreamMaxDuration rollover
+// (always checked right after a ReadAvailable call returns, never mid-frame:
+// see DESIGN.md's "谁来决定轮转" for why the writer, not the reader, must own
+// this decision) or writePipe closing because the connection is shutting
+// down. It always returns nil unless writing to pw itself fails, in which
+// case doSendStream's request is already doomed and the error is surfaced
+// through sendLoopStream via doSendStream's own resp/err handling.
+func (c *httpConn) feedSendStream(pw *io.PipeWriter) error {
+	buf := make([]byte, c.streamMaxFrame)
+	heartbeat := c.limits.HeartbeatInterval()
+	deadline := time.Now().Add(c.limits.StreamMaxDuration())
+
+	for {
+		n, err := c.writePipe.ReadAvailable(buf, heartbeat, c.coalesceWindow)
+		if errors.Is(err, io.EOF) {
+			// writePipe closed: Close() was called. End this leg cleanly;
+			// sendLoopStream's own c.ctx/c.closed check stops it from
+			// reopening another one.
+			writeFrame(pw, frameEnd, nil)
+			pw.Close()
+			return nil
+		}
+
+		if n > 0 {
+			if err := writeFrame(pw, frameData, buf[:n]); err != nil {
+				pw.CloseWithError(err)
+				return err
+			}
+		} else if err := writeFrame(pw, frameHeartbeat, nil); err != nil {
+			pw.CloseWithError(err)
+			return err
+		}
+
+		if time.Now().After(deadline) {
+			writeFrame(pw, frameEnd, nil)
+			pw.Close()
+			return nil
+		}
 	}
 }
 

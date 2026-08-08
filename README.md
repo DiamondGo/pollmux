@@ -26,17 +26,27 @@ yamux 的 keepalive 会周期性发 PING 并要求对端在 `ConnectionWriteTime
 
 `PollMode = "stream"` 下结论不变，但机制更简单：流式响应内部本来就周期性地发心跳帧（见下），这本身就是一条应用层 keepalive，yamux 自己的 PING/PONG 彻底没有存在必要——但仍然必须保持关闭，理由和 batch 模式一样：yamux 不知道底下是 batch 还是 stream，打开 keepalive 唯一的效果就是白白重新触发上面这套超时问题。
 
-### 二、上下行吞吐是不对称的
+### 二、上下行吞吐是不对称的（在 batch 模式下,以及在只开了一半流式的情况下）
 
-两个方向走的是**不同机制**，性能特征因此不同：
+两个方向走的是**不同机制**，性能特征因此不同——但这只在你只开了一个方向的流式模式时才成立。两个方向都开(见下一节)之后,两边其实是同一种机制。
 
 | 方向 | 机制 | 受什么限制 |
 |---|---|---|
-| 上行（客户端 → 服务端） | 数据到达即发 POST，短窗口内合并 | 基本不受 RTT 限制；受 `max_send_bytes` 分片上限约束 |
+| 上行（客户端 → 服务端，`PreferStreamUpload = false`） | 数据到达即发一个离散 POST，短窗口内合并，同一时刻只有一个请求在途 | **每 RTT 最多发出一个 `max_send_bytes` 分片** |
+| 上行（客户端 → 服务端，`PreferStreamUpload = true`） | 一条长驻 POST 的请求体保持打开，数据随到随发 | 链路带宽本身，不再逐 RTT 摊销 |
 | 下行（服务端 → 客户端，`PollMode = "batch"`） | 长轮询响应，一次最多带回 `poll_buffer_bytes` | **每 RTT 最多一个缓冲区** |
 | 下行（服务端 → 客户端，`PollMode = "stream"`） | 长轮询响应保持打开，数据随到随推 | 链路带宽本身，不再逐 RTT 摊销 |
 
-batch 模式下行的含义要算一下：`poll_buffer_bytes` 默认 256KB，在 150ms RTT 下单条隧道下行上限约 **1.7 MB/s**。这个上限来自"离散 POST + 批量响应"这个模型本身，不是实现缺陷。彻底解法是下行流式化：把 `ServerConfig.PollMode` 设为 `"stream"`（同时客户端 `Connector.PreferStream = true`），下行响应不再等一整个 RTT 攒够一个缓冲区就返回，而是保持连接打开，数据一到就编帧推送。仓库自带的 `bench_test.go`（`BenchmarkThroughput_Batch_150msRTT` / `BenchmarkThroughput_Stream_150msRTT`，用服务端中间件模拟 150ms RTT）在这台开发机上的一次实测：batch 约 1.0 MB/s（与上面的公式量级一致），stream 约 28.7 MB/s —— 不再随 RTT 线性下降。这是本地回环 + 人为延迟的模拟数据，不是真实链路的数字；生产环境请在自己的部署上重新跑一遍这两个 benchmark（`go test -run '^$' -bench BenchmarkThroughput -benchtime=1x`）。
+早期版本这里写的是"上行基本不受 RTT 限制"——**这个结论是错的**，已经用 benchmark 证伪：上行原来的离散 POST 实现和 batch 模式下行是同一种"一个 RTT 一个分片"的结构，只是分片大小换成了 `max_send_bytes` 而不是 `poll_buffer_bytes`。`bench_test.go` 的 `BenchmarkUploadThroughput_Batch_150msRTT` 在这台开发机上量到约 1.9 MB/s，和下面 batch 下行的量级完全一致，不是巧合。
+
+batch 模式下行的含义要算一下：`poll_buffer_bytes` 默认 256KB，在 150ms RTT 下单条隧道下行上限约 **1.7 MB/s**。这个上限来自"离散 POST + 批量响应"这个模型本身，不是实现缺陷。彻底解法是流式化：下行把 `ServerConfig.PollMode` 设为 `"stream"`，上行把 `PreferStreamUpload`/`UploadStreamMode` 也谈成 `"stream"`（两者通常一起开，见下一节），响应/请求体都不再等一整个 RTT 攒够一个缓冲区才收发，而是保持连接打开，数据一到就编帧推送。仓库自带的 `bench_test.go` 在这台开发机上的一次实测（150ms RTT，8MB payload）：
+
+| | batch | stream |
+|---|---|---|
+| 下行 `BenchmarkThroughput_*` | ~1.0 MB/s | ~28.7 MB/s |
+| 上行 `BenchmarkUploadThroughput_*` | ~1.9 MB/s | ~30 MB/s |
+
+两个方向流式化之后都不再随 RTT 线性下降,量级也基本对齐。这是本地回环 + 人为延迟的模拟数据，不是真实链路的数字；生产环境请在自己的部署上重新跑一遍这些 benchmark（`go test -run '^$' -bench Benchmark -benchtime=1x`）。
 
 同一个数字也出现在 yamux 的流窗口上：yamux 强制 `MaxStreamWindowSize ≥ 256KB`（`mux.go:83`，地板值不是默认值），所以两处的 256KB 是对齐的。调小任何一个都会成为新瓶颈。
 
@@ -54,6 +64,24 @@ batch 模式下行的含义要算一下：`poll_buffer_bytes` 默认 256KB，在
 客户端侧多一层存活性检测：流式响应的 HTTP 响应头几乎立刻返回（不像 batch 要等一整个长轮询超时），所以 `ResponseHeaderTimeout` 只覆盖连接建立，不再是"链路是否还活着"的信号；取而代之的是一个读空闲看门狗，每收到一帧（心跳或数据）就重置，超过 `HeartbeatInterval + PollGrace` 没收到任何帧就判定传输失败。
 
 响应体内部有四种帧：`frameData`（数据）、`frameHeartbeat`（心跳）、`frameEnd`（良性结束——`StreamMaxDuration` 到期轮转，会话仍然活着，客户端应立即重开一条新的流式轮询）、`frameGone`（致命结束——会话已经在服务端被关闭，重开轮询只会对着一个不存在的 session id 反复拿到同样的 `frameGone`，客户端必须把它当成 batch 模式里 410 的等价物，触发 `TransportFailed` 走重连，而不是重开轮询）。这两种"结束"语义不同，帧类型也必须不同——`v0.1.0` 曾经两者共用 `frameEnd`，导致会话被关闭后客户端分不清，一直对着死会话重开轮询，`v0.1.1` 起分离为独立帧类型修复。
+
+### 四、上行流式模式
+
+上一节的流式化只覆盖下行。上行（客户端 → 服务端）默认仍然是离散 POST——"二、上下行吞吐是不对称的"里已经说明，这不是"基本不受 RTT 限制"，而是和 batch 下行同构的瓶颈，只是分片大小不同。上行流式化把同一套思路应用到反方向。
+
+开启方式：客户端 `Connector.PreferStream = true` 会同时请求下行和上行两种流式（内部分别置位 `ConnectRequest.PreferStreamMode` 和 `PreferStreamUpload`），服务端只要 `ServerConfig.PollMode = pollmux.PollModeStream` 就同时支持两个方向——**没有单独的"只支持上行"开关**，一个部署要么两个方向都提供，要么都不提供。两个方向仍然在协议层面**独立协商**（`ConnectResponse.PollMode` 和 `UploadStreamMode` 是两个字段），纯粹是为了让新旧版本的客户端/服务端可以任意混搭：一个只认识下行流式的旧服务端，收到不认识的 `prefer_stream_upload` 字段会直接忽略，新客户端读到 `UploadStreamMode` 是空字符串就照常退回离散 POST 上行，不会去发它读不懂的请求。
+
+机制上行方向不是对下行 `pollStream` 简单镜像，因为上行方向读者和写者是反过来的：客户端是写者（把数据编帧写进请求体），服务端是读者（`PollHandler` 收到 `X-Send-Stream: true` 后转给 `pollSendStream`，循环解帧、边收边喂给应用层，不等请求结束）。这个角色反转带来一个关键设计决定：
+
+**轮转（`StreamMaxDuration` 到期后开下一条请求）永远由写者决定，不是读者。** 下行方向服务端是写者，服务端说了算；上行方向客户端是写者，改成客户端说了算——客户端在写完一个完整的数据/心跳帧之后才检查是否到点，从不在帧中途做这个决定。原因是正确性：如果读者单方面决定"够了，我要回应了"，它没法保证自己是在帧边界上做这个决定，一旦在帧中途把响应发回去，请求体会被 net/http 当成没读完直接把连接关掉，此时数据可能已经从本地缓冲区取出、正在传输路上，会真实丢失、造成 yamux 流失步。写者永远知道"刚完成一个完整单元、现在切换安全"这件事，读者不知道。
+
+其他要点：
+
+- `frameGone` 在上行方向用不上——它在下行方向的语义是"服务端主动通知会话已关闭"，但上行方向服务端是读者，没有主动写请求体的机会。会话被服务端关闭这件事,上行方向靠 410 状态码表达（`pollSendStream` 发现 `Session` 已关闭就直接回 410，客户端按老规矩当传输失败处理），不需要新的帧类型。
+- 上行方向"会话已死"的检测**不是独立的**，是从下行那条腿"借"来的：两个方向总是一起协商、一起打开，会话被关闭时下行那条腿的 `frameGone` 会先感知到并触发 `c.fail()`，进而通过共享的 `context` 取消掉上行这条腿正在进行的请求。上行自己的 410 检测只是兜底，不是第一道防线——独立触发时最长要等到下一次心跳（写者试图往一个已经断开的管道里写心跳帧时才会发现），不是瞬时的。
+- 服务端读上行请求体时用 `http.ResponseController.SetReadDeadline` 做空闲看门狗（每收到一帧就重置），这是 Go 1.20+ 的标准机制，不需要额外的 context/goroutine 拼接。
+
+详见 pollmux 仓库的 `DESIGN.md`（不随库发布，是给下一个改这块的人看的实现笔记）。
 
 ---
 

@@ -744,6 +744,60 @@ func TestConnectStaysBatchWhenClientDoesNotPreferStream(t *testing.T) {
 	}
 }
 
+// --- upload-stream negotiation -----------------------------------------------
+//
+// Negotiated independently of PollMode on the wire (see DESIGN.md), gated by
+// the same server-side switch — these tests mirror the three PollMode
+// negotiation tests above, one per combination that matters.
+
+func TestConnectNegotiatesUploadStreamWhenBothSidesAgree(t *testing.T) {
+	cfg := testServerConfig()
+	cfg.PollMode = PollModeStream
+	cfg.HeartbeatInterval = 111 * time.Millisecond
+	cfg.StreamMaxDuration = 999 * time.Millisecond
+	ts, _ := newTestServer(t, cfg, Hooks{})
+
+	_, cr := postConnect(t, ts, ConnectRequest{ProtocolVersion: ProtocolVersion, PreferStreamUpload: true})
+	if cr.UploadStreamMode != PollModeStream {
+		t.Fatalf("UploadStreamMode = %q, want %q", cr.UploadStreamMode, PollModeStream)
+	}
+	// A client relying only on PreferStreamUpload (not PreferStreamMode) still
+	// needs the Heartbeat/StreamMaxDuration limits to drive its send loop.
+	if cr.Limits.HeartbeatInterval() != cfg.HeartbeatInterval {
+		t.Fatalf("heartbeat_interval_ms = %v, want %v", cr.Limits.HeartbeatInterval(), cfg.HeartbeatInterval)
+	}
+	if cr.Limits.StreamMaxDuration() != cfg.StreamMaxDuration {
+		t.Fatalf("stream_max_duration_ms = %v, want %v", cr.Limits.StreamMaxDuration(), cfg.StreamMaxDuration)
+	}
+}
+
+func TestConnectStaysBatchUploadWhenServerDoesNotOfferStream(t *testing.T) {
+	cfg := testServerConfig() // PollMode left at "" (batch)
+	ts, _ := newTestServer(t, cfg, Hooks{})
+
+	_, cr := postConnect(t, ts, ConnectRequest{ProtocolVersion: ProtocolVersion, PreferStreamUpload: true})
+	if cr.UploadStreamMode != "" {
+		t.Fatalf("UploadStreamMode = %q, want empty when the server does not offer stream", cr.UploadStreamMode)
+	}
+}
+
+func TestConnectStaysBatchUploadWhenClientDoesNotPreferIt(t *testing.T) {
+	cfg := testServerConfig()
+	cfg.PollMode = PollModeStream
+	ts, _ := newTestServer(t, cfg, Hooks{})
+
+	// PreferStreamMode true but PreferStreamUpload left false: the two
+	// directions negotiate independently, so download-only stream must not
+	// silently also turn on upload streaming.
+	_, cr := postConnect(t, ts, ConnectRequest{ProtocolVersion: ProtocolVersion, PreferStreamMode: true})
+	if cr.PollMode != PollModeStream {
+		t.Fatalf("PollMode = %q, want %q", cr.PollMode, PollModeStream)
+	}
+	if cr.UploadStreamMode != "" {
+		t.Fatalf("UploadStreamMode = %q, want empty when the client does not prefer it", cr.UploadStreamMode)
+	}
+}
+
 // --- pollStream ---------------------------------------------------------------
 
 func testStreamServerConfig() ServerConfig {
@@ -1077,5 +1131,162 @@ func TestPollStreamEndsPromptlyWhenHeartbeatFrameWriteFails(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("pollStream did not return after a heartbeat frame write failure")
+	}
+}
+
+// --- pollSendStream -----------------------------------------------------------
+
+// connectStreamUpload connects with both PreferStreamMode and
+// PreferStreamUpload set — the combination httpConn.Connect actually sends —
+// and fails the test unless the server negotiated upload streaming too.
+func connectStreamUpload(t *testing.T, ts *httptest.Server) ConnectResponse {
+	t.Helper()
+	resp, cr := postConnect(t, ts, ConnectRequest{
+		ProtocolVersion:    ProtocolVersion,
+		PreferStreamMode:   true,
+		PreferStreamUpload: true,
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("connect status = %d, want 200", resp.StatusCode)
+	}
+	if cr.UploadStreamMode != PollModeStream {
+		t.Fatalf("UploadStreamMode = %q, want %q — upload streaming did not negotiate", cr.UploadStreamMode, PollModeStream)
+	}
+	return cr
+}
+
+// startSendStream opens one X-Send-Stream POST against id with a body fed by
+// an io.Pipe, so the test can write frames into it while the request is still
+// open — the send-stream analogue of the poll helper above, which only
+// supports a fixed, already-complete body. The response arrives on the
+// returned channel once the request ends (frameEnd, EOF, or an error).
+func startSendStream(t *testing.T, ts *httptest.Server, id string) (*io.PipeWriter, <-chan *http.Response) {
+	t.Helper()
+	pr, pw := io.Pipe()
+	respCh := make(chan *http.Response, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/tunnel/"+id+"/poll", pr)
+		if err != nil {
+			t.Errorf("build send-stream request: %v", err)
+			respCh <- nil
+			return
+		}
+		req.Header.Set(HeaderSendStream, "true")
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Errorf("send-stream request: %v", err)
+			respCh <- nil
+			return
+		}
+		respCh <- resp
+	}()
+	return pw, respCh
+}
+
+func TestPollSendStreamDeliversDataWithoutRequestEnding(t *testing.T) {
+	cfg := testStreamServerConfig()
+	ts, st := newTestServer(t, cfg, Hooks{})
+	cr := connectStreamUpload(t, ts)
+	s, _ := st.Get(cr.SessionID)
+
+	pw, respCh := startSendStream(t, ts, cr.SessionID)
+
+	for i, want := range [][]byte{[]byte("first"), []byte("second"), []byte("third")} {
+		readCh := make(chan []byte, 1)
+		go func() {
+			buf := make([]byte, 64)
+			n, _ := s.Read(buf)
+			readCh <- append([]byte(nil), buf[:n]...)
+		}()
+
+		if err := writeFrame(pw, frameData, want); err != nil {
+			t.Fatalf("frame %d: write: %v", i, err)
+		}
+
+		select {
+		case got := <-readCh:
+			if string(got) != string(want) {
+				t.Fatalf("frame %d: Session.Read = %q, want %q", i, got, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("frame %d: timed out waiting for it via Session.Read — pollSendStream must not wait "+
+				"for the request to end before the application sees data", i)
+		}
+	}
+
+	// Clean up: end the request explicitly instead of leaving it parked.
+	writeFrame(pw, frameEnd, nil)
+	pw.Close()
+	select {
+	case resp := <-respCh:
+		if resp == nil {
+			t.Fatal("send-stream request failed")
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("send-stream status = %d, want 200", resp.StatusCode)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("send-stream request did not end after frameEnd")
+	}
+}
+
+func TestPollSendStreamHeartbeatFramesDeliverNoData(t *testing.T) {
+	cfg := testStreamServerConfig()
+	ts, st := newTestServer(t, cfg, Hooks{})
+	cr := connectStreamUpload(t, ts)
+	s, _ := st.Get(cr.SessionID)
+
+	pw, respCh := startSendStream(t, ts, cr.SessionID)
+
+	for range 3 {
+		if err := writeFrame(pw, frameHeartbeat, nil); err != nil {
+			t.Fatalf("write heartbeat: %v", err)
+		}
+	}
+	writeFrame(pw, frameEnd, nil)
+	pw.Close()
+
+	select {
+	case resp := <-respCh:
+		if resp == nil {
+			t.Fatal("send-stream request failed")
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("send-stream status = %d, want 200", resp.StatusCode)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("send-stream request did not end after frameEnd")
+	}
+
+	if n := s.toServer.Buffered(); n != 0 {
+		t.Fatalf("toServer buffered %d bytes, want 0 — heartbeat frames must not reach the application", n)
+	}
+}
+
+func TestPollSendStreamRespondsGoneWhenSessionAlreadyClosed(t *testing.T) {
+	cfg := testStreamServerConfig()
+	ts, st := newTestServer(t, cfg, Hooks{})
+	cr := connectStreamUpload(t, ts)
+	s, _ := st.Get(cr.SessionID)
+
+	s.Close()
+
+	pw, respCh := startSendStream(t, ts, cr.SessionID)
+	writeFrame(pw, frameData, []byte("too late"))
+	pw.Close()
+
+	select {
+	case resp := <-respCh:
+		if resp == nil {
+			t.Fatal("send-stream request failed")
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusGone {
+			t.Fatalf("send-stream status = %d, want 410 for a closed session", resp.StatusCode)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("send-stream request did not end")
 	}
 }

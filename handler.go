@@ -267,6 +267,12 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 		}
 
 		negotiatedMode := negotiatePollMode(cfg.PollMode, req.PreferStreamMode)
+		// Gated by the same server-side switch as download streaming — an
+		// operator turning on PollModeStream gets both directions, there is
+		// no independent server-side toggle for upload alone (see
+		// DESIGN.md). The wire field stays separate from PollMode purely for
+		// safe negotiation against mismatched binary versions.
+		negotiatedUpload := negotiatePollMode(cfg.PollMode, req.PreferStreamUpload)
 
 		s := newSession(id, meta)
 		s.pollMode = negotiatedMode
@@ -288,12 +294,23 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 
 		cfg.Logger.Info("pollmux: session created", "session_id", id)
 
+		uploadStreamMode := ""
+		// limitsMode drives whether cfg.limits() includes the
+		// Heartbeat/StreamMaxDuration fields: needed if either direction
+		// negotiated stream, not just download.
+		limitsMode := negotiatedMode
+		if negotiatedUpload == PollModeStream {
+			uploadStreamMode = PollModeStream
+			limitsMode = PollModeStream
+		}
+
 		writeJSON(w, http.StatusOK, ConnectResponse{
-			ProtocolVersion: ProtocolVersion,
-			SessionID:       id,
-			Limits:          cfg.limits(negotiatedMode),
-			Meta:            meta,
-			PollMode:        negotiatedMode,
+			ProtocolVersion:  ProtocolVersion,
+			SessionID:        id,
+			Limits:           cfg.limits(limitsMode),
+			Meta:             meta,
+			PollMode:         negotiatedMode,
+			UploadStreamMode: uploadStreamMode,
 		})
 	})
 }
@@ -322,6 +339,11 @@ func PollHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 		// park is useless for health reporting.
 		if h.OnPoll != nil {
 			h.OnPoll(s, r)
+		}
+
+		if r.Header.Get(HeaderSendStream) == "true" {
+			pollSendStream(w, r, s, cfg)
+			return
 		}
 
 		body := http.MaxBytesReader(w, r.Body, int64(cfg.MaxSendBytes))
@@ -460,6 +482,75 @@ func pollStream(w http.ResponseWriter, r *http.Request, s *Session, cfg ServerCo
 		if time.Now().After(deadline) {
 			writeFrame(w, frameEnd, nil)
 			flusher.Flush()
+			return
+		}
+	}
+}
+
+// pollSendStream serves the upload-stream half of PollHandler: instead of
+// reading one discrete, bounded request body and answering at once, it reads
+// a sequence of frames off the (potentially long-lived) request body and
+// writes each data frame's payload upstream as soon as it is decoded — it
+// never waits for the request to end. The client (see httpConn.
+// feedSendStream), not this handler, decides when to end one request and
+// open the next: it is the writer, so it is the only side that knows when it
+// is safely between frames (see DESIGN.md's "谁来决定轮转" section). This
+// handler just reads until told to stop.
+func pollSendStream(w http.ResponseWriter, r *http.Request, s *Session, cfg ServerConfig) {
+	s.pollInFlight.Add(1)
+	defer s.pollInFlight.Add(-1)
+
+	// A read-idle watchdog is this handler's only liveness signal: unlike
+	// pollStream (where the server is the writer and controls the pace
+	// itself), here the server is a passive reader and has no other way to
+	// notice a client that has gone silent without actually closing the
+	// connection. defaultStreamReadGrace is a local safety margin — it never
+	// needs to match anything the client declares.
+	rc := http.NewResponseController(w)
+	resetDeadline := func() {
+		rc.SetReadDeadline(time.Now().Add(cfg.HeartbeatInterval + defaultStreamReadGrace))
+	}
+	resetDeadline()
+
+	fr := newFrameReader(r.Body, cfg.MaxSendBytes)
+	for {
+		typ, payload, err := fr.next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// Clean end at a frame boundary: same as an explicit
+				// frameEnd, the client already knows to reopen.
+				w.WriteHeader(http.StatusOK)
+			}
+			// Anything else — a deadline expiring, a mid-frame network
+			// error — leaves no good response to give; net/http will close
+			// the connection once this handler returns without having read
+			// the body to completion, which is exactly the signal the
+			// client's sendStreamClient.Do() needs to treat this as a
+			// transport failure.
+			return
+		}
+		resetDeadline()
+
+		switch typ {
+		case frameData:
+			if len(payload) == 0 {
+				continue
+			}
+			if _, err := s.writeUpstream(payload); err != nil {
+				cfg.Logger.Debug("pollmux: send-stream write failed, session is gone",
+					"session_id", s.ID, "error", err)
+				writeError(w, http.StatusGone, "session closed")
+				return
+			}
+		case frameHeartbeat:
+			// Nothing to do beyond the resetDeadline above.
+		case frameEnd:
+			w.WriteHeader(http.StatusOK)
+			return
+		default:
+			cfg.Logger.Debug("pollmux: unexpected frame type on send-stream",
+				"session_id", s.ID, "frame_type", typ)
+			writeError(w, http.StatusBadRequest, "unexpected frame type on send-stream")
 			return
 		}
 	}
