@@ -44,6 +44,7 @@ type fakeServer struct {
 
 	uploadStreamMode bool // if true, connect negotiates upload streaming when asked
 	sendStreamGone   bool // if true, every send-stream request answers 410
+	sendStreamHang   bool // if true, every send-stream request (including probes) never answers until the request context ends
 
 	mu                 sync.Mutex
 	sends              [][]byte
@@ -232,10 +233,34 @@ func (f *fakeServer) serveSendStream(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.sendStreamRequests++
 	gone := f.sendStreamGone
+	hang := f.sendStreamHang
 	f.mu.Unlock()
 
 	if gone {
 		w.WriteHeader(http.StatusGone)
+		return
+	}
+	if hang {
+		// Simulates a proxy that buffers a long-lived chunked request body
+		// instead of forwarding it — the exact condition
+		// Connector.UploadStreamPreference's auto-detect probe exists to
+		// catch: bytes are consumed (like a buffering proxy accepting them
+		// onto its own queue) but never answered. Draining r.Body here,
+		// rather than parking on r.Context().Done() without reading
+		// anything, is also what lets this handler notice a client that
+		// gives up mid-body — net/http only detects a dead connection while
+		// a handler is blocked if that handler is actually blocked in a
+		// Read. Once the body ends (a bounded probe always sends frameEnd),
+		// there is nothing left to read to notice a client that gives up
+		// afterwards, so the fallback timer below caps how long this
+		// handler — and so httptest.Server.Close() in test cleanup — waits;
+		// it only needs to comfortably outlast every probe timeout used in
+		// these tests.
+		io.Copy(io.Discard, r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
 		return
 	}
 
@@ -1200,6 +1225,7 @@ func TestUploadStreamWritesArriveWithoutRequestEnding(t *testing.T) {
 
 	c := f.connector()
 	c.PreferStream = true
+	c.UploadStreamPreference = PollModeStream // this test targets the stream path directly, not auto-detect
 	conn := mustConnect(t, c)
 
 	if _, err := conn.Write([]byte("hello upload")); err != nil {
@@ -1230,6 +1256,7 @@ func TestUploadStreamRotatesAtStreamMaxDuration(t *testing.T) {
 
 	c := f.connector()
 	c.PreferStream = true
+	c.UploadStreamPreference = PollModeStream // this test targets the stream path directly, not auto-detect
 	conn := mustConnect(t, c)
 
 	want := [][]byte{[]byte("one"), []byte("two"), []byte("three")}
@@ -1302,6 +1329,7 @@ func TestUploadStreamTreatsGoneAsTransportFailure(t *testing.T) {
 
 	c := f.connector()
 	c.PreferStream = true
+	c.UploadStreamPreference = PollModeStream // this test targets doSendStream's 410 handling directly, not auto-detect
 	conn := mustConnect(t, c)
 
 	conn.Write([]byte("into the void"))
@@ -1325,6 +1353,7 @@ func TestUploadStreamCloseIsPrompt(t *testing.T) {
 
 	c := f.connector()
 	c.PreferStream = true
+	c.UploadStreamPreference = PollModeStream // this test targets the stream path directly, not auto-detect
 	conn := mustConnect(t, c)
 
 	start := time.Now()
@@ -1333,5 +1362,144 @@ func TestUploadStreamCloseIsPrompt(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("Close took %v, should not wait out HeartbeatInterval/StreamMaxDuration", elapsed)
+	}
+}
+
+// --- upload streaming: auto-detect probe ---------------------------------------
+
+// TestUploadStreamAutoProbePassesAndUsesStreamPath is the success half of
+// Connector.UploadStreamPreference's default ("") behaviour: when the server
+// offers upload streaming and the probe completes, the real connection uses
+// the stream path, not the discrete batch one.
+func TestUploadStreamAutoProbePassesAndUsesStreamPath(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.uploadStreamMode = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	c.UploadProbeTimeout = time.Second // fakeServer answers the probe immediately; this is just a safety bound
+	conn := mustConnect(t, c)
+
+	if _, err := conn.Write([]byte("hello upload")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	waitFor(t, time.Second, func() bool {
+		for _, got := range f.allStreamSends() {
+			if string(got) == "hello upload" {
+				return true
+			}
+		}
+		return false
+	})
+	if n := len(f.sentBodies()); n != 0 {
+		t.Fatalf("sentBodies (batch path) = %d, want 0 — the probe should have passed and stayed on the stream path", n)
+	}
+}
+
+// TestUploadStreamAutoProbeTimesOutAndFallsBackToBatch is the failure half:
+// a path that never answers a send-stream request (the fakeServer stand-in
+// for a proxy that buffers a long-lived chunked body instead of forwarding
+// it — see README's Cloudflare note) must not be used for real data. The
+// probe has to give up within UploadProbeTimeout and this connection must
+// use the discrete batch path for the rest of its lifetime.
+func TestUploadStreamAutoProbeTimesOutAndFallsBackToBatch(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.uploadStreamMode = true
+	f.sendStreamHang = true
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	c.UploadProbeTimeout = 100 * time.Millisecond // keep the test fast
+	conn := mustConnect(t, c)
+
+	if _, err := conn.Write([]byte("batch after failed probe")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	waitFor(t, time.Second, func() bool { return len(f.sentBodies()) == 1 })
+	if got := f.sentBodies()[0]; string(got) != "batch after failed probe" {
+		t.Fatalf("sentBodies[0] = %q, want %q", got, "batch after failed probe")
+	}
+	if n := len(f.allStreamSends()); n != 0 {
+		t.Fatalf("streamSends = %d, want 0 — a failed probe must never let real data reach the stream path", n)
+	}
+}
+
+// TestUploadStreamPreferenceBatchNeverOffersStreamOrProbes confirms
+// UploadStreamPreference == PollModeBatch declines upload streaming on the
+// wire outright (see doConnect) rather than negotiating it and then probing:
+// the server never even sees a PreferStreamUpload request, so it cannot
+// offer stream, so no probe runs and no send-stream request of any kind is
+// ever opened.
+func TestUploadStreamPreferenceBatchNeverOffersStreamOrProbes(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.uploadStreamMode = true // the server would offer it, if asked
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	c.UploadStreamPreference = PollModeBatch
+	conn := mustConnect(t, c)
+
+	if _, err := conn.Write([]byte("always batch")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	waitFor(t, time.Second, func() bool { return len(f.sentBodies()) == 1 })
+
+	f.mu.Lock()
+	got := f.connects[0].PreferStreamUpload
+	requests := f.sendStreamRequests
+	f.mu.Unlock()
+	if got {
+		t.Fatal("PreferStreamUpload = true, want false — UploadStreamPreference=batch must decline it on the wire")
+	}
+	if requests != 0 {
+		t.Fatalf("sendStreamRequests = %d, want 0 — batch preference must never open a send-stream request, probe included", requests)
+	}
+}
+
+// TestUploadStreamPreferenceStreamSkipsProbe confirms UploadStreamPreference
+// == PollModeStream commits to the stream path immediately: even against a
+// server that would fail the auto-detect probe, forcing stream must not
+// probe first — it trusts the caller's own confirmation that the path works.
+func TestUploadStreamPreferenceStreamSkipsProbe(t *testing.T) {
+	f := newFakeServer(t)
+	f.streamMode = true
+	f.uploadStreamMode = true
+	f.sendStreamHang = true // would fail any probe — must never be consulted
+	f.heartbeatMS = 5000
+	f.streamMaxMS = 10000
+
+	c := f.connector()
+	c.PreferStream = true
+	c.UploadStreamPreference = PollModeStream
+	c.UploadProbeTimeout = 100 * time.Millisecond // irrelevant if the probe is correctly skipped
+
+	start := time.Now()
+	mustConnect(t, c)
+	// If a probe ran despite the forced preference, sendStreamHang would
+	// block it out to UploadProbeTimeout — Connect returning promptly is
+	// proof no probe happened.
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("Connect took %v, want near-instant — a forced stream preference must skip the probe", elapsed)
+	}
+}
+
+func TestConnectorRejectsInvalidUploadStreamPreference(t *testing.T) {
+	f := newFakeServer(t)
+	c := f.connector()
+	c.UploadStreamPreference = "sideways"
+
+	if _, err := c.Connect(context.Background()); err == nil {
+		t.Fatal("Connect did not reject an invalid UploadStreamPreference")
 	}
 }

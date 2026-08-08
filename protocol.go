@@ -36,6 +36,12 @@ const (
 	// available and read continuously by the server, instead of one discrete
 	// chunk per request. Mutually exclusive with HeaderSendOnly.
 	HeaderSendStream = "X-Send-Stream"
+	// HeaderSendStreamProbe marks a send-stream request as Connector's
+	// connect-time transport probe (see Connector.UploadStreamPreference):
+	// otherwise handled exactly like a real send-stream request, except the
+	// server discards the frames instead of writing them upstream. Always
+	// sent together with HeaderSendStream, never alone.
+	HeaderSendStreamProbe = "X-Send-Stream-Probe"
 )
 
 // Server-side defaults. See ServerConfig.
@@ -75,7 +81,26 @@ const (
 	DefaultSendTimeout  = 15 * time.Second
 	DefaultDialTimeout  = 10 * time.Second
 	DefaultMaxSendChunk = 512 << 10
+
+	// DefaultUploadProbeTimeout bounds Connector's connect-time auto-detect
+	// probe for upload streaming (see Connector.UploadStreamPreference).
+	// Some intermediate proxies (observed with Cloudflare's standard tiers)
+	// buffer a long-lived chunked request body instead of forwarding it to
+	// the origin as it arrives, which — combined with yamux's flow-control
+	// window — turns into a permanent hang under real traffic rather than a
+	// clean error. The probe reproduces that exact condition once at connect
+	// time so a broken path is caught here, bounded by this timeout, instead
+	// of hanging a live session later.
+	DefaultUploadProbeTimeout = 15 * time.Second
 )
+
+// uploadProbeFillerBytes is how many bytes of filler Connector's auto-detect
+// probe (see probeUploadStream) pushes through a real send-stream request
+// before ending it. It is deliberately more than MaxStreamWindowSize: that is
+// the exact amount of unacknowledged upload data that reproduced the real
+// Cloudflare hang (see README), so a probe that pushed less could pass on a
+// path that still breaks under real traffic.
+const uploadProbeFillerBytes = MaxStreamWindowSize + 4<<10
 
 // DefaultCoalesceWindow is used by both directions when no explicit value is
 // configured: the read side lets a poll response accumulate a little more data

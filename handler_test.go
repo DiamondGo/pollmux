@@ -1162,6 +1162,20 @@ func connectStreamUpload(t *testing.T, ts *httptest.Server) ConnectResponse {
 // returned channel once the request ends (frameEnd, EOF, or an error).
 func startSendStream(t *testing.T, ts *httptest.Server, id string) (*io.PipeWriter, <-chan *http.Response) {
 	t.Helper()
+	return startSendStreamHeaders(t, ts, id, nil)
+}
+
+// startSendStreamProbe is startSendStream with HeaderSendStreamProbe set, for
+// exercising pollSendStream's probe branch (see Connector.
+// UploadStreamPreference / probeUploadStream): the server must discard the
+// frames instead of writing them upstream.
+func startSendStreamProbe(t *testing.T, ts *httptest.Server, id string) (*io.PipeWriter, <-chan *http.Response) {
+	t.Helper()
+	return startSendStreamHeaders(t, ts, id, map[string]string{HeaderSendStreamProbe: "true"})
+}
+
+func startSendStreamHeaders(t *testing.T, ts *httptest.Server, id string, extraHeaders map[string]string) (*io.PipeWriter, <-chan *http.Response) {
+	t.Helper()
 	pr, pw := io.Pipe()
 	respCh := make(chan *http.Response, 1)
 	go func() {
@@ -1172,6 +1186,9 @@ func startSendStream(t *testing.T, ts *httptest.Server, id string) (*io.PipeWrit
 			return
 		}
 		req.Header.Set(HeaderSendStream, "true")
+		for k, v := range extraHeaders {
+			req.Header.Set(k, v)
+		}
 		resp, err := ts.Client().Do(req)
 		if err != nil {
 			t.Errorf("send-stream request: %v", err)
@@ -1288,5 +1305,48 @@ func TestPollSendStreamRespondsGoneWhenSessionAlreadyClosed(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("send-stream request did not end")
+	}
+}
+
+// TestPollSendStreamProbeDiscardsPayloadWithoutWritingUpstream is the
+// server-side half of Connector.UploadStreamPreference's auto-detect probe:
+// a probe request must be handled like a real send-stream request in every
+// way that's externally observable (200 at frameEnd, same idle watchdog),
+// except its frames must never reach the session — it carries no real data.
+func TestPollSendStreamProbeDiscardsPayloadWithoutWritingUpstream(t *testing.T) {
+	cfg := testStreamServerConfig()
+	ts, st := newTestServer(t, cfg, Hooks{})
+	cr := connectStreamUpload(t, ts)
+	s, _ := st.Get(cr.SessionID)
+
+	readCh := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, _ := s.Read(buf)
+		readCh <- append([]byte(nil), buf[:n]...)
+	}()
+
+	pw, respCh := startSendStreamProbe(t, ts, cr.SessionID)
+	writeFrame(pw, frameData, []byte("this must never reach the session"))
+	writeFrame(pw, frameEnd, nil)
+	pw.Close()
+
+	select {
+	case resp := <-respCh:
+		if resp == nil {
+			t.Fatal("probe request failed")
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("probe status = %d, want 200", resp.StatusCode)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("probe request did not end")
+	}
+
+	select {
+	case got := <-readCh:
+		t.Fatalf("Session.Read returned %q, want nothing — a probe's frames must be discarded, not written upstream", got)
+	case <-time.After(200 * time.Millisecond):
 	}
 }

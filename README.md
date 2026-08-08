@@ -83,6 +83,18 @@ batch 模式下行的含义要算一下：`poll_buffer_bytes` 默认 256KB，在
 
 详见 pollmux 仓库的 `DESIGN.md`（不随库发布，是给下一个改这块的人看的实现笔记）。
 
+#### 连接期自动探测：`Connector.UploadStreamPreference`
+
+生产环境实测过一个前提：并不是每条链路都能如实转发一个长驻、持续写入的 chunked 请求体。Cloudflare 标准（非 Enterprise）套餐对普通 HTTP 代理走的是"攒完整个请求体再转发给源站"的模型，不支持把一个还没结束的请求体实时流式转发——一旦上行方向的 yamux 单流未确认数据超过 `MaxStreamWindowSize`（256KB），发送方等待的窗口更新永远等不到，整条隧道会**永久挂死**，不是变慢。这不是理论风险，是线上复现过的真实故障。
+
+`Connector.UploadStreamPreference` 是三态开关，用来在"能获得流式上行的吞吐"和"不确定链路是否支持时不要挂死生产"之间做选择：
+
+- `PollModeBatch`：永远不用上行流式，哪怕服务端提供。`ConnectRequest.PreferStreamUpload` 直接发 `false`，不协商、不探测。
+- `PollModeStream`：只要服务端提供就直接用，不做探测。只在你已经用其他方式确认过这条链路（有没有经过 Cloudflare 之类的缓冲代理）能实时转发长驻请求体时才应该这么配置。
+- `""`（默认，自动）：协商成功后，`Connect` 先做一次一次性探测——通过一个真正的 send-stream 请求推送超过 `MaxStreamWindowSize` 的填充数据、正常以 `frameEnd` 结束、等真实响应，整个过程套一个 `Connector.UploadProbeTimeout`（默认 15s，可调）的硬超时。探测在超时内正常收到 200 就采用流式上行；超时或出错（`context deadline exceeded` 是最常见的一种，代表这条链路没在超时内把请求转发到源站）就退回离散 POST，这条连接的生命周期内不会再重试流式。探测是有意做成"和生产真实一条 send-stream 请求完全同形"的——推送、结束、等响应——而不是发明一套"请求体还开着就提前应答"的专用协议：那种设计在本地回环网络下用 Go 标准库实测就不可靠（客户端能否在请求体写完之前先读到响应头，取决于 Go/内核缓冲区的内部实现细节，不是文档承诺的行为），线上环境只会更不可控。探测请求带 `X-Send-Stream-Probe` 头，服务端据此丢弃这些帧而不写入会话，不会污染真实数据。
+
+三态里显式配置的两种（`batch`/`stream`）总是零延迟；只有默认的自动档会在每次 `Connect` 上多付出一次探测的时间成本（成功时通常几毫秒，失败时最多 `UploadProbeTimeout`）。
+
 ---
 
 ## 协议与行为约定

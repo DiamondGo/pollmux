@@ -105,6 +105,23 @@ type Connector struct {
 	// batch poll loop with no error and no visible difference to the caller
 	// beyond throughput.
 	PreferStream bool
+	// UploadStreamPreference controls the upload direction independently of
+	// PreferStream, mirroring the wire-level independence between
+	// PreferStreamMode and PreferStreamUpload:
+	//   - PollModeBatch: never use upload streaming, even if the server
+	//     offers it. No probe is run.
+	//   - PollModeStream: always use upload streaming once the server
+	//     offers it. No probe is run — use this only once you have already
+	//     confirmed the path (proxies, CDNs) between client and server
+	//     forwards a long-lived chunked request body in real time.
+	//   - "" (default): auto-detect. If the server offers upload streaming,
+	//     Connect runs a one-time probe (bounded by UploadProbeTimeout)
+	//     before deciding; a path that fails the probe falls back to the
+	//     discrete per-chunk send path for the lifetime of this connection.
+	UploadStreamPreference string
+	// UploadProbeTimeout bounds the auto-detect probe run when
+	// UploadStreamPreference is "". Defaults to DefaultUploadProbeTimeout.
+	UploadProbeTimeout time.Duration
 	// Logger receives transport diagnostics. Nil disables logging.
 	Logger *slog.Logger
 }
@@ -127,6 +144,12 @@ func (c *Connector) logger() *slog.Logger {
 func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 	if c.BaseURL == "" {
 		return nil, errors.New("pollmux: Connector.BaseURL is required")
+	}
+	switch c.UploadStreamPreference {
+	case "", PollModeBatch, PollModeStream:
+	default:
+		return nil, fmt.Errorf("pollmux: Connector.UploadStreamPreference = %q, only \"\", %q, and %q are valid",
+			c.UploadStreamPreference, PollModeBatch, PollModeStream)
 	}
 
 	base := strings.TrimRight(c.BaseURL, "/") + c.pathPrefix()
@@ -234,19 +257,46 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 		streamMode:        negotiatedMode == PollModeStream,
 		streamIdleTimeout: cr.Limits.HeartbeatInterval() + pollGrace,
 		streamMaxFrame:    orInt(cr.Limits.PollBufferBytes, DefaultPollBufferSize),
-
-		uploadStreamMode: negotiatedUpload,
 	}
 
 	if negotiatedUpload {
-		// The response to a send-stream request only arrives once the whole
-		// request ends (StreamMaxDuration rollover or the connection closing),
-		// so — unlike sendClient's short SendTimeout for a discrete send —
-		// this transport's ResponseHeaderTimeout has to cover a whole stream
-		// leg, the same reasoning as pollTransport's batch-mode branch above.
+		// The response to a real send-stream request only arrives once the
+		// whole request ends (StreamMaxDuration rollover or the connection
+		// closing), so — unlike sendClient's short SendTimeout for a
+		// discrete send — this transport's ResponseHeaderTimeout has to
+		// cover a whole stream leg, the same reasoning as pollTransport's
+		// batch-mode branch above. The auto-detect probe below bounds itself
+		// separately with its own request context, so it is not blocked by
+		// this long timeout.
 		sendStreamTransport := c.newTransport(dialTimeout, cr.Limits.StreamMaxDuration()+pollGrace)
 		conn.sendStreamClient = &http.Client{Transport: sendStreamTransport, CheckRedirect: noRedirect}
-		conn.writePipe = NewBufferedPipe()
+
+		switch c.UploadStreamPreference {
+		case PollModeStream:
+			// Forced on: the caller has already confirmed the path forwards
+			// a long-lived chunked body in real time, so skip the probe.
+			conn.uploadStreamMode = true
+		case PollModeBatch:
+			// Unreachable in practice — doConnect only sets
+			// PreferStreamUpload when UploadStreamPreference != PollModeBatch,
+			// so the server would never have negotiated negotiatedUpload —
+			// but kept explicit rather than falling through the default
+			// (auto-probe) case if that invariant ever changes.
+			conn.uploadStreamMode = false
+		default: // "" — auto-detect
+			probeTimeout := orDuration(c.UploadProbeTimeout, DefaultUploadProbeTimeout)
+			conn.uploadStreamMode = conn.probeUploadStream(probeTimeout)
+			if !conn.uploadStreamMode {
+				logger.Warn("pollmux: upload-stream probe did not pass within timeout, "+
+					"falling back to batch uploads for this connection — "+
+					"a proxy on this path likely buffers a long-lived request body instead of forwarding it live",
+					"probe_timeout", probeTimeout)
+			}
+		}
+
+		if conn.uploadStreamMode {
+			conn.writePipe = NewBufferedPipe()
+		}
 	}
 
 	logger.Debug("pollmux: connected",
@@ -255,7 +305,7 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 		"session_timeout", cr.Limits.SessionTimeout(),
 		"poll_buffer_bytes", cr.Limits.PollBufferBytes,
 		"poll_mode", negotiatedMode,
-		"upload_stream_mode", negotiatedUpload,
+		"upload_stream_mode", conn.uploadStreamMode,
 	)
 
 	conn.wg.Add(1)
@@ -298,7 +348,7 @@ func (c *Connector) doConnect(ctx context.Context, client *http.Client, base str
 		ProtocolVersion:    ProtocolVersion,
 		Meta:               c.Meta,
 		PreferStreamMode:   c.PreferStream,
-		PreferStreamUpload: c.PreferStream,
+		PreferStreamUpload: c.UploadStreamPreference != PollModeBatch,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pollmux: failed to encode connect request: %w", err)
@@ -826,6 +876,72 @@ func (c *httpConn) doSend(chunk []byte) error {
 	default:
 		return &fatalPollError{status: resp.StatusCode}
 	}
+}
+
+// probeUploadStream is Connect's connect-time auto-detect check, run once
+// when Connector.UploadStreamPreference == "". It pushes uploadProbeFillerBytes
+// of filler through a real send-stream request — comfortably more than
+// MaxStreamWindowSize, the amount of unacknowledged upload data that
+// reproduced the real Cloudflare hang (see README) — then ends the request
+// (frameEnd) and waits for the response, bounded by timeout.
+//
+// This deliberately reuses the exact shape and timing of a real send-stream
+// leg (see doSendStream/feedSendStream) rather than inventing a bespoke
+// mid-stream-ack fast path: an early "reply while the request is still open"
+// design turned out to be unreliable even on a local loopback connection —
+// whether the client's HTTP transport surfaces the response before the body
+// finishes sending depends on internal buffering behavior that isn't part of
+// any documented contract. A bounded probe of realistic size, timed
+// end-to-end, is slower to fail (up to timeout) but actually trustworthy.
+//
+// The probe never touches writePipe or the real session: the server
+// recognizes HeaderSendStreamProbe and discards the frames instead of
+// writing them upstream, so this is safe to run before any real data is
+// queued to send.
+func (c *httpConn) probeUploadStream(timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(c.ctx, timeout)
+	defer cancel()
+
+	pr, pw := io.Pipe()
+	go func() {
+		// Chunked well under any reasonable MaxSendBytes, rather than one
+		// uploadProbeFillerBytes-sized frame, so a deployment with a small
+		// configured MaxSendBytes still decodes the probe instead of
+		// rejecting an oversized frame.
+		const probeChunk = 32 << 10
+		chunk := make([]byte, probeChunk)
+		for sent := 0; sent < uploadProbeFillerBytes; {
+			n := min(probeChunk, uploadProbeFillerBytes-sent)
+			if err := writeFrame(pw, frameData, chunk[:n]); err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+			sent += n
+		}
+		writeFrame(pw, frameEnd, nil)
+		pw.Close()
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.pollURL, pr)
+	if err != nil {
+		pw.CloseWithError(err)
+		return false
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set(HeaderSendStream, "true")
+	req.Header.Set(HeaderSendStreamProbe, "true")
+	req.ContentLength = -1
+	c.setAuth(req)
+
+	resp, err := c.sendStreamClient.Do(req)
+	if err != nil {
+		// Includes context.DeadlineExceeded — the expected outcome on a path
+		// that does not forward this request to the origin within timeout.
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	return resp.StatusCode == http.StatusOK
 }
 
 // sendLoopStream is flushLoop's upload-stream counterpart: instead of one

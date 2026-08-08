@@ -512,6 +512,16 @@ func pollSendStream(w http.ResponseWriter, r *http.Request, s *Session, cfg Serv
 	}
 	resetDeadline()
 
+	// A probe request (see Connector.UploadStreamPreference /
+	// probeUploadStream) carries no real session data: its frames are
+	// discarded instead of being written upstream. Otherwise it is handled
+	// exactly like a real send-stream request — same bounded shape (filler,
+	// then frameEnd), same response-at-the-end timing — deliberately, so the
+	// probe exercises the identical code path and timing as production
+	// traffic rather than a bespoke fast-path that might behave differently
+	// under a buffering proxy.
+	probe := r.Header.Get(HeaderSendStreamProbe) == "true"
+
 	fr := newFrameReader(r.Body, cfg.MaxSendBytes)
 	for {
 		typ, payload, err := fr.next()
@@ -534,6 +544,9 @@ func pollSendStream(w http.ResponseWriter, r *http.Request, s *Session, cfg Serv
 		switch typ {
 		case frameData:
 			if len(payload) == 0 {
+				continue
+			}
+			if probe {
 				continue
 			}
 			if _, err := s.writeUpstream(payload); err != nil {
