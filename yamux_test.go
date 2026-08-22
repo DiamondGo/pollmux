@@ -14,15 +14,23 @@ import (
 // tested over net.Pipe instead of a real HTTP server.
 type fakeConn struct {
 	io.ReadWriteCloser
-	failed chan struct{}
-	once   sync.Once
+	failed     chan struct{}
+	superseded chan struct{}
+	once       sync.Once
 }
 
 func newFakeConn(rwc io.ReadWriteCloser) *fakeConn {
-	return &fakeConn{ReadWriteCloser: rwc, failed: make(chan struct{})}
+	return &fakeConn{
+		ReadWriteCloser: rwc,
+		failed:          make(chan struct{}),
+		superseded:      make(chan struct{}),
+	}
 }
 
 func (c *fakeConn) TransportFailed() <-chan struct{} { return c.failed }
+func (c *fakeConn) SessionSuperseded() <-chan struct{} {
+	return c.superseded
+}
 func (c *fakeConn) Limits() Limits                   { return Limits{} }
 func (c *fakeConn) SessionID() string                { return "fake" }
 func (c *fakeConn) Meta() map[string]string          { return nil }

@@ -19,6 +19,10 @@ const (
 	// almost immediately; backing off here would leave a working link idle for
 	// minutes waiting on a peer that may already be back.
 	OutcomePeerClosed
+	// OutcomeSuperseded: a newer connect from the same Connector already
+	// replaced this session. Stop reconnecting — another loop or session is
+	// already active.
+	OutcomeSuperseded
 	// OutcomeShutdown: the context was cancelled. Stop.
 	OutcomeShutdown
 )
@@ -29,6 +33,8 @@ func (o Outcome) String() string {
 		return "transport_failed"
 	case OutcomePeerClosed:
 		return "peer_closed"
+	case OutcomeSuperseded:
+		return "superseded"
 	case OutcomeShutdown:
 		return "shutdown"
 	default:
@@ -59,6 +65,11 @@ type ReconnectLoop struct {
 	// PeerClosedPause is the short pause after a peer-closed outcome, just
 	// enough to avoid a tight spin. Defaults to DefaultPeerClosedPause.
 	PeerClosedPause time.Duration
+	// MinStableDuration is how long Serve must run before a transport failure
+	// resets backoff to InitialBackoff. Defaults to DefaultMinStableDuration.
+	// Set to -1 to disable (backoff keeps escalating through short-lived
+	// sessions).
+	MinStableDuration time.Duration
 
 	// Logger receives reconnect diagnostics. Nil disables logging.
 	Logger *slog.Logger
@@ -82,21 +93,15 @@ func (l *ReconnectLoop) Run(ctx context.Context) error {
 	initial := orDuration(l.InitialBackoff, DefaultInitialBackoff)
 	maxBackoff := orDuration(l.MaxBackoff, DefaultMaxBackoff)
 	peerPause := orDuration(l.PeerClosedPause, DefaultPeerClosedPause)
+	minStable := DefaultMinStableDuration
+	if l.MinStableDuration != 0 {
+		minStable = l.MinStableDuration
+	}
+	if minStable < 0 {
+		minStable = 0
+	}
 
 	backoff := initial
-	// Whether the previous attempt ended in transport trouble. A peer-closed
-	// round leaves this false, so it neither advances the backoff nor resets it
-	// — only recovery from an actual link failure does.
-	//
-	// Note what this implies: because a transport failure sets it, every
-	// successful connect resets the backoff, so a link that connects and then
-	// immediately dies retries at InitialBackoff forever rather than
-	// escalating. That is deliberate — escalating would need a rule about how
-	// long a connection must survive before it counts as recovery, which is a
-	// judgement this loop has no basis to make. The trade buys fast recovery
-	// after a real outage, at the cost of a steady retry rate against a link
-	// that keeps flapping.
-	lastFailWasTransport := true
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -117,23 +122,23 @@ func (l *ReconnectLoop) Run(ctx context.Context) error {
 				return ctx.Err()
 			}
 			backoff = min(backoff*2, maxBackoff)
-			lastFailWasTransport = true
 			continue
 		}
 
-		if lastFailWasTransport {
-			backoff = initial
-		}
-		lastFailWasTransport = false
-
 		logger.Info("pollmux: connected", "session_id", conn.SessionID())
 
+		serveStart := time.Now()
 		outcome := l.Serve(ctx, conn)
 		conn.Close()
+		servedFor := time.Since(serveStart)
 
 		switch outcome {
 		case OutcomeShutdown:
 			return ctx.Err()
+
+		case OutcomeSuperseded:
+			logger.Info("pollmux: session superseded by a newer connect, stopping reconnect loop")
+			return nil
 
 		case OutcomePeerClosed:
 			logger.Info("pollmux: peer closed the session, reconnecting promptly")
@@ -143,8 +148,11 @@ func (l *ReconnectLoop) Run(ctx context.Context) error {
 			// Deliberately no backoff change: the link is healthy.
 
 		default: // OutcomeTransportFailed
-			logger.Warn("pollmux: transport failed, reconnecting with backoff", "retry_in", backoff)
-			lastFailWasTransport = true
+			if minStable > 0 && servedFor >= minStable {
+				backoff = initial
+			}
+			logger.Warn("pollmux: transport failed, reconnecting with backoff",
+				"retry_in", backoff, "served_for", servedFor)
 			if !sleepOrDone(ctx, backoff) {
 				return ctx.Err()
 			}

@@ -48,6 +48,8 @@ type fakeServer struct {
 
 	websocketMode bool // if true, connect negotiates websocket transport when asked; heartbeatMS still governs its Limits
 
+	goneSessions map[string]struct{} // receive-only polls for these session ids answer 410
+
 	mu                 sync.Mutex
 	sends              [][]byte
 	sendHdrs           []http.Header
@@ -170,6 +172,17 @@ func (f *fakeServer) servePoll(w http.ResponseWriter, r *http.Request) {
 
 	f.mu.Lock()
 	f.pollHdrs = append(f.pollHdrs, r.Header.Clone())
+	pollPath := strings.TrimPrefix(r.URL.Path, f.prefix)
+	if strings.HasSuffix(pollPath, "/poll") {
+		sid := strings.TrimSuffix(strings.TrimPrefix(pollPath, "/"), "/poll")
+		if sid != "" {
+			if _, gone := f.goneSessions[sid]; gone {
+				f.mu.Unlock()
+				w.WriteHeader(http.StatusGone)
+				return
+			}
+		}
+	}
 	f.mu.Unlock()
 
 	if f.pollStatus != 0 {
@@ -559,6 +572,38 @@ func TestPoll410TriggersTransportFailed(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("410 did not report transport failure")
 	}
+}
+
+func TestPoll410IgnoredWhenSessionSuperseded(t *testing.T) {
+	f := newFakeServer(t)
+	connector := f.connector()
+
+	f.sessionID = "sess-a"
+	conn1 := mustConnect(t, connector)
+
+	f.sessionID = "sess-b"
+	conn2 := mustConnect(t, connector)
+
+	f.goneSessions = map[string]struct{}{"sess-a": {}}
+
+	select {
+	case <-conn1.SessionSuperseded():
+	case <-conn1.TransportFailed():
+		t.Fatal("superseded session reported transport failure")
+	case <-time.After(2 * time.Second):
+		t.Fatal("superseded session did not report supersession")
+	}
+
+	select {
+	case <-conn2.TransportFailed():
+		t.Fatal("active session was treated as failed when an older session got 410")
+	case <-conn2.SessionSuperseded():
+		t.Fatal("active session was superseded")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	conn1.Close()
+	conn2.Close()
 }
 
 func TestPollFatalStatuses(t *testing.T) {

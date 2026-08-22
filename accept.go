@@ -50,6 +50,9 @@ func AcceptLoop(ctx context.Context, sess *yamux.Session, conn Conn, handle func
 		case <-conn.TransportFailed():
 			return OutcomeTransportFailed
 
+		case <-conn.SessionSuperseded():
+			return OutcomeSuperseded
+
 		case <-sess.CloseChan():
 			return classifyClose(conn)
 

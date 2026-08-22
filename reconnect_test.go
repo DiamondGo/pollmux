@@ -147,12 +147,10 @@ func TestReconnectLoopPausesAfterTransportFailure(t *testing.T) {
 	}
 }
 
-// Documented behaviour: a successful connect resets the backoff. The
-// consequence is that a link which connects and then immediately dies keeps
-// retrying at InitialBackoff instead of escalating. That is the trade for
-// recovering quickly after a real outage; escalating would need a rule about
-// how long a connection must survive to count as recovery.
-func TestReconnectLoopResetsBackoffOnEverySuccessfulConnect(t *testing.T) {
+// A session that connects and dies immediately must escalate backoff rather
+// than retry at InitialBackoff forever — that steady rate is what turns a
+// reconnect replacement loop into a storm.
+func TestReconnectLoopEscalatesBackoffOnFlapping(t *testing.T) {
 	var rec attemptRecorder
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -162,19 +160,22 @@ func TestReconnectLoopResetsBackoffOnEverySuccessfulConnect(t *testing.T) {
 			rec.record()
 			return newFakeConn(nopRWC{}), nil
 		},
-		Serve:          func(context.Context, Conn) Outcome { return OutcomeTransportFailed },
-		InitialBackoff: 30 * time.Millisecond,
-		MaxBackoff:     2 * time.Second,
+		Serve:             func(context.Context, Conn) Outcome { return OutcomeTransportFailed },
+		InitialBackoff:    30 * time.Millisecond,
+		MaxBackoff:        2 * time.Second,
+		MinStableDuration: 10 * time.Millisecond,
 	}
 
 	go l.Run(ctx)
 	waitForCount(t, 3*time.Second, &rec, 5)
 	cancel()
 
-	for i, gap := range rec.gaps() {
-		if gap > 150*time.Millisecond {
-			t.Fatalf("gap %d was %v; a connect that succeeds must reset the backoff to ~30ms", i, gap)
-		}
+	gaps := rec.gaps()
+	if len(gaps) < 3 {
+		t.Fatalf("only %d gaps recorded", len(gaps))
+	}
+	if gaps[2] <= gaps[0] {
+		t.Fatalf("backoff did not escalate on flapping sessions: gaps[0]=%v gaps[2]=%v", gaps[0], gaps[2])
 	}
 }
 
@@ -258,9 +259,13 @@ func TestReconnectLoopResetsBackoffAfterRecovery(t *testing.T) {
 			}
 			return newFakeConn(nopRWC{}), nil
 		},
-		Serve:          func(context.Context, Conn) Outcome { return OutcomeTransportFailed },
-		InitialBackoff: 30 * time.Millisecond,
-		MaxBackoff:     2 * time.Second,
+		Serve: func(context.Context, Conn) Outcome {
+			time.Sleep(20 * time.Millisecond)
+			return OutcomeTransportFailed
+		},
+		InitialBackoff:    30 * time.Millisecond,
+		MaxBackoff:        2 * time.Second,
+		MinStableDuration: 10 * time.Millisecond,
 	}
 
 	go l.Run(ctx)

@@ -239,6 +239,7 @@ func (c *Connector) connectWebSocket(ctx context.Context, base string, cr *Conne
 
 	connCtx, cancelConn := context.WithCancel(context.Background())
 	conn := &wsConn{
+		sessionGuard:    newSessionGuard(c, cr.SessionID, cancelConn),
 		sessionID:       cr.SessionID,
 		deleteURL:       fmt.Sprintf("%s/%s", base, cr.SessionID),
 		authToken:       c.AuthToken,
@@ -261,6 +262,8 @@ func (c *Connector) connectWebSocket(ctx context.Context, base string, cr *Conne
 	go conn.readLoop()
 	go conn.writeLoop()
 
+	c.adoptSession(cr.SessionID)
+
 	return conn, nil
 }
 
@@ -270,6 +273,7 @@ func (c *Connector) connectWebSocket(ctx context.Context, base string, cr *Conne
 // read loop and one write loop, each on a BufferedPipe the same way
 // httpConn's stream-mode paths already work.
 type wsConn struct {
+	sessionGuard
 	sessionID  string
 	deleteURL  string
 	authToken  string
@@ -300,6 +304,15 @@ func (c *wsConn) SessionID() string                { return c.sessionID }
 func (c *wsConn) Limits() Limits                   { return c.limits }
 func (c *wsConn) Meta() map[string]string          { return maps.Clone(c.meta) }
 func (c *wsConn) TransportFailed() <-chan struct{} { return c.transportFailed }
+
+func (c *wsConn) onTransportProblem(err error) {
+	if c.supersededByNewerConnect(c.logger) {
+		c.readPipe.Close()
+		return
+	}
+	c.logger.Warn("pollmux: websocket transport problem, signalling failure", "error", err)
+	c.fail()
+}
 
 // fail signals transport failure once and unblocks anyone reading.
 func (c *wsConn) fail() {
@@ -382,8 +395,7 @@ func (c *wsConn) readLoop() {
 			if c.ctx.Err() != nil || c.closed.Load() {
 				return // deliberate shutdown, not a failure
 			}
-			c.logger.Warn("pollmux: websocket read failed, signalling transport failure", "error", err)
-			c.fail()
+			c.onTransportProblem(err)
 			return
 		}
 		if typ != websocket.MessageBinary {
@@ -391,8 +403,7 @@ func (c *wsConn) readLoop() {
 		}
 		ft, payload, err := wsDecode(msg)
 		if err != nil {
-			c.logger.Warn("pollmux: malformed websocket frame, signalling transport failure", "error", err)
-			c.fail()
+			c.onTransportProblem(err)
 			return
 		}
 		switch ft {
@@ -405,8 +416,7 @@ func (c *wsConn) readLoop() {
 		case frameHeartbeat:
 			// Liveness only.
 		default:
-			c.logger.Warn("pollmux: unexpected websocket frame type", "type", ft)
-			c.fail()
+			c.onTransportProblem(fmt.Errorf("unexpected websocket frame type %v", ft))
 			return
 		}
 	}
@@ -438,8 +448,7 @@ func (c *wsConn) writeLoop() {
 			if c.ctx.Err() != nil || c.closed.Load() {
 				return // deliberate shutdown, not a failure
 			}
-			c.logger.Warn("pollmux: websocket write failed, signalling transport failure", "error", err)
-			c.fail()
+			c.onTransportProblem(err)
 			return
 		}
 	}

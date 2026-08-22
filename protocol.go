@@ -111,9 +111,10 @@ const DefaultCoalesceWindow = 2 * time.Millisecond
 
 // Reconnect defaults. See ReconnectLoop.
 const (
-	DefaultInitialBackoff  = 1 * time.Second
-	DefaultMaxBackoff      = 3 * time.Minute
-	DefaultPeerClosedPause = 500 * time.Millisecond
+	DefaultInitialBackoff     = 1 * time.Second
+	DefaultMaxBackoff         = 3 * time.Minute
+	DefaultPeerClosedPause    = 500 * time.Millisecond
+	DefaultMinStableDuration  = 5 * time.Second
 )
 
 // ConnectRequest is the JSON body of POST {prefix}/connect.

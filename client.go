@@ -52,6 +52,11 @@ type Conn interface {
 	// logs across both ends.
 	SessionID() string
 
+	// SessionSuperseded is closed when this session was replaced by a newer
+	// connect from the same Connector. Callers should stop reconnecting — a
+	// fresher session is already active.
+	SessionSuperseded() <-chan struct{}
+
 	// Meta returns the metadata the server returned at connect time, which is
 	// whatever Hooks.Authenticate produced merged with what we declared.
 	Meta() map[string]string
@@ -136,6 +141,21 @@ type Connector struct {
 	PreferWebSocket bool
 	// Logger receives transport diagnostics. Nil disables logging.
 	Logger *slog.Logger
+
+	activeSessionMu sync.Mutex
+	activeSessionID string
+}
+
+func (c *Connector) adoptSession(id string) {
+	c.activeSessionMu.Lock()
+	c.activeSessionID = id
+	c.activeSessionMu.Unlock()
+}
+
+func (c *Connector) isActiveSession(id string) bool {
+	c.activeSessionMu.Lock()
+	defer c.activeSessionMu.Unlock()
+	return c.activeSessionID == id
 }
 
 func (c *Connector) pathPrefix() string {
@@ -262,6 +282,7 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 
 	connCtx, cancel := context.WithCancel(context.Background())
 	conn := &httpConn{
+		sessionGuard:    newSessionGuard(c, cr.SessionID, cancel),
 		sessionID:       cr.SessionID,
 		pollURL:         fmt.Sprintf("%s/%s/poll", base, cr.SessionID),
 		deleteURL:       fmt.Sprintf("%s/%s", base, cr.SessionID),
@@ -324,6 +345,8 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 			conn.writePipe = NewBufferedPipe()
 		}
 	}
+
+	c.adoptSession(cr.SessionID)
 
 	logger.Debug("pollmux: connected",
 		"max_send_chunk", effectiveChunk,
@@ -439,6 +462,7 @@ func (c *Connector) doConnect(ctx context.Context, client *http.Client, base str
 // Read and write are deliberately independent. Because a send never waits for
 // the poll in flight, one direction can never head-of-line block the other.
 type httpConn struct {
+	sessionGuard
 	sessionID string
 	pollURL   string
 	deleteURL string
@@ -502,6 +526,37 @@ func (c *httpConn) Meta() map[string]string {
 }
 
 func (c *httpConn) TransportFailed() <-chan struct{} { return c.transportFailed }
+
+func (c *httpConn) onSessionClosed() {
+	if c.supersededByNewerConnect(c.logger) {
+		if c.readPipe != nil {
+			c.readPipe.Close()
+		}
+		if c.writePipe != nil {
+			c.writePipe.Close()
+		}
+		return
+	}
+	c.fail()
+}
+
+func (c *httpConn) onTransportProblem(err error) {
+	if isSessionClosedErr(err) {
+		c.onSessionClosed()
+		return
+	}
+	if c.supersededByNewerConnect(c.logger) {
+		if c.readPipe != nil {
+			c.readPipe.Close()
+		}
+		if c.writePipe != nil {
+			c.writePipe.Close()
+		}
+		return
+	}
+	c.logger.Warn("pollmux: transport problem, signalling failure", "error", err)
+	c.fail()
+}
 
 // fail signals transport failure once and unblocks anyone reading.
 func (c *httpConn) fail() {
@@ -606,8 +661,11 @@ func (c *httpConn) pollLoop() {
 			if c.ctx.Err() != nil || c.closed.Load() {
 				return // deliberate shutdown, not a failure
 			}
-			c.logger.Warn("pollmux: poll failed, signalling transport failure", "error", err)
-			c.fail()
+			if isSessionClosedErr(err) {
+				c.onSessionClosed()
+				return
+			}
+			c.onTransportProblem(err)
 			return
 		}
 
@@ -730,8 +788,11 @@ func (c *httpConn) pollLoopStream() {
 		if c.ctx.Err() != nil || c.closed.Load() {
 			return // deliberate shutdown, not a failure
 		}
-		c.logger.Warn("pollmux: stream poll failed, signalling transport failure", "error", err)
-		c.fail()
+		if isSessionClosedErr(err) {
+			c.onSessionClosed()
+			return
+		}
+		c.onTransportProblem(err)
 		return
 	}
 }
@@ -855,8 +916,7 @@ func (c *httpConn) flushLoop() {
 			n := min(len(buf), c.maxSendChunk)
 			if err := c.doSend(buf[:n]); err != nil {
 				if c.ctx.Err() == nil && !c.closed.Load() {
-					c.logger.Warn("pollmux: send failed, signalling transport failure", "error", err)
-					c.fail()
+					c.onTransportProblem(err)
 				}
 				c.clearFlight()
 				return
@@ -987,8 +1047,7 @@ func (c *httpConn) sendLoopStream() {
 			if c.ctx.Err() != nil || c.closed.Load() {
 				return // deliberate shutdown, not a failure
 			}
-			c.logger.Warn("pollmux: send-stream failed, signalling transport failure", "error", err)
-			c.fail()
+			c.onTransportProblem(err)
 			return
 		}
 		// nil error: a clean, client-decided rollover. Open the next request
