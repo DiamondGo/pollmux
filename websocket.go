@@ -63,15 +63,15 @@ func WebSocketHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler 
 			writeError(w, http.StatusBadRequest, "session was not negotiated for websocket transport")
 			return
 		}
-		if !s.wsAttached.CompareAndSwap(false, true) {
-			// In practice unreachable — ReconnectLoop always calls Connect
-			// for a fresh session id rather than reattaching to an old one
-			// — but a session having two WebSockets fighting over the same
-			// toClient/toServer pipes would be a real, confusing bug, so
-			// this stays a hard error rather than an assumption.
-			writeError(w, http.StatusConflict, "session already has a websocket attached")
+		if !s.beginWebSocket() {
+			if s.IsClosed() {
+				writeError(w, http.StatusGone, "session closed")
+			} else {
+				writeError(w, http.StatusConflict, "session already has a websocket attached")
+			}
 			return
 		}
+		defer s.endWebSocket()
 		s.touch()
 
 		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -87,9 +87,6 @@ func WebSocketHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler 
 			return
 		}
 		c.SetReadLimit(int64(cfg.MaxSendBytes) + 1) // +1 for wsEncode's type byte
-
-		s.pollInFlight.Add(1)
-		defer s.pollInFlight.Add(-1)
 
 		// Not r.Context(): coder/websocket's Accept doc warns that using the
 		// request context after Accept returns "may lead to unexpected

@@ -434,6 +434,52 @@ func TestPollInFlightIsVisibleWhileParked(t *testing.T) {
 	waitFor(t, time.Second, func() bool { return s.PollInFlight() == 0 })
 }
 
+func TestConditionalCloseRejectsBatchPollThenPollsClosedSession(t *testing.T) {
+	ts, st := newTestServer(t, testServerConfig(), Hooks{})
+	cr := connectOK(t, ts)
+	s, _ := st.Get(cr.SessionID)
+
+	done := make(chan *http.Response, 1)
+	go func() { done <- poll(t, ts, cr.SessionID, nil, map[string]string{HeaderReceiveOnly: "true"}) }()
+	waitFor(t, time.Second, func() bool { return s.PollInFlight() == 1 })
+	if CloseSessionIfNoPollInFlight(st, Hooks{}, s, ReasonServerClose) {
+		t.Fatal("closed a session with a batch poll in flight")
+	}
+	resp := <-done
+	resp.Body.Close()
+	if !CloseSessionIfNoPollInFlight(st, Hooks{}, s, ReasonServerClose) {
+		t.Fatal("close failed after batch poll returned")
+	}
+	resp = poll(t, ts, cr.SessionID, nil, map[string]string{HeaderReceiveOnly: "true"})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("poll after close = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestConditionalCloseRejectsStreamPoll(t *testing.T) {
+	cfg := testServerConfig()
+	cfg.PollMode = PollModeStream
+	cfg.HeartbeatInterval = 20 * time.Millisecond
+	cfg.StreamMaxDuration = 500 * time.Millisecond
+	ts, st := newTestServer(t, cfg, Hooks{})
+	resp, cr := postConnect(t, ts, ConnectRequest{ProtocolVersion: ProtocolVersion, PreferStreamMode: true})
+	if resp.StatusCode != http.StatusOK || cr.PollMode != PollModeStream {
+		t.Fatalf("stream connect = %d mode %q", resp.StatusCode, cr.PollMode)
+	}
+	s, _ := st.Get(cr.SessionID)
+
+	done := make(chan *http.Response, 1)
+	go func() { done <- poll(t, ts, cr.SessionID, nil, map[string]string{HeaderReceiveOnly: "true"}) }()
+	waitFor(t, time.Second, func() bool { return s.PollInFlight() == 1 })
+	if CloseSessionIfNoPollInFlight(st, Hooks{}, s, ReasonServerClose) {
+		t.Fatal("closed a session with a stream poll in flight")
+	}
+	CloseSession(st, Hooks{}, s, ReasonServerClose)
+	got := <-done
+	got.Body.Close()
+}
+
 // OnPoll runs before the wait, so a health report is acted on now rather than
 // a poll timeout later.
 func TestOnPollRunsBeforeTheWait(t *testing.T) {

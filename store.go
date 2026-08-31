@@ -103,32 +103,47 @@ func (st *SessionStore) StartSweeper(interval, timeout time.Duration, onEvict fu
 	}
 }
 
+// removeAndMarkClosed removes s only if it is still the store's current object.
+// Lock order throughout lifecycle operations is SessionStore.mu -> Session.mu.
+func (st *SessionStore) removeAndMarkClosed(s *Session, requireIdle bool) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if current, ok := st.sessions[s.ID]; !ok || current != s {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || (requireIdle && s.pollInFlight != 0) {
+		return false
+	}
+	s.closed = true
+	delete(st.sessions, s.ID)
+	return true
+}
+
 // sweep evicts every session that has gone quiet past timeout with no poll
-// parked on it.
+// parked on it. The final expiry and transport checks happen while holding both
+// lifecycle locks, so a poll cannot attach between checking and removal.
 func (st *SessionStore) sweep(timeout time.Duration, onEvict func(*Session)) {
 	now := time.Now()
 	var expired []*Session
 
 	st.mu.Lock()
 	for id, s := range st.sessions {
-		if s.PollInFlight() > 0 {
-			continue
+		s.mu.Lock()
+		if !s.closed && s.pollInFlight == 0 && now.Sub(s.lastActive) > timeout {
+			s.closed = true
+			delete(st.sessions, id)
+			expired = append(expired, s)
 		}
-		if now.Sub(s.LastActive()) <= timeout {
-			continue
-		}
-		delete(st.sessions, id)
-		expired = append(expired, s)
+		s.mu.Unlock()
 	}
 	st.mu.Unlock()
 
-	// Closing and notifying happen outside the store lock: onEvict runs
-	// application code, which must not be able to deadlock the store.
-	//
-	// closeOnce gates the callback so that a session already closed elsewhere
-	// — a DELETE landing at the same moment, say — is not announced twice.
+	// Pipe closing and application callbacks always happen outside locks.
 	for _, s := range expired {
-		if s.closeOnce() && onEvict != nil {
+		s.closePipes()
+		if onEvict != nil {
 			onEvict(s)
 		}
 	}

@@ -4,7 +4,6 @@ import (
 	"log/slog"
 	"maps"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -54,7 +53,7 @@ type Session struct {
 	// Connect for a fresh session id rather than reattaching to an old one —
 	// but WebSocketHandler still checks this defensively rather than
 	// assuming the caller never will.
-	wsAttached atomic.Bool
+	wsAttached bool
 
 	// pollInFlight counts long polls currently parked in the handler. A value
 	// above zero means a TCP connection is being held open by this client right
@@ -62,7 +61,7 @@ type Session struct {
 	// when that TCP connection does break, the handler returns and the count
 	// drops immediately, which is what turns a silent client death into a fast
 	// detection instead of a session_timeout wait (A3).
-	pollInFlight atomic.Int32
+	pollInFlight int32
 
 	mu         sync.Mutex
 	lastActive time.Time
@@ -115,16 +114,62 @@ func (s *Session) Close() error {
 // happens exactly once even when a delete and an eviction race.
 func (s *Session) closeOnce() bool {
 	s.mu.Lock()
+	won := s.markClosedLocked()
+	s.mu.Unlock()
+	if won {
+		s.closePipes()
+	}
+	return won
+}
+
+// markClosedLocked performs the session lifecycle transition. s.mu must be held.
+func (s *Session) markClosedLocked() bool {
 	if s.closed {
-		s.mu.Unlock()
 		return false
 	}
 	s.closed = true
-	s.mu.Unlock()
+	return true
+}
 
+func (s *Session) closePipes() {
 	s.toServer.Close()
 	s.toClient.Close()
+}
+
+// beginPoll atomically attaches a poll or persistent transport unless the
+// session has already been closed.
+func (s *Session) beginPoll() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.pollInFlight++
 	return true
+}
+
+func (s *Session) endPoll() {
+	s.mu.Lock()
+	s.pollInFlight--
+	s.mu.Unlock()
+}
+
+func (s *Session) beginWebSocket() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.wsAttached {
+		return false
+	}
+	s.wsAttached = true
+	s.pollInFlight++
+	return true
+}
+
+func (s *Session) endWebSocket() {
+	s.mu.Lock()
+	s.wsAttached = false
+	s.pollInFlight--
+	s.mu.Unlock()
 }
 
 // writeUpstream queues data the client sent for the application to read.
@@ -153,10 +198,13 @@ func (s *Session) touch() {
 	s.mu.Unlock()
 }
 
-// PollInFlight returns the number of long polls currently parked on this
-// session. Above zero means the client is demonstrably still connected.
+// PollInFlight returns an observational snapshot of attached polls and
+// persistent transports. It must not be used to decide whether to close the
+// session; use CloseSessionIfNoPollInFlight for that atomic operation.
 func (s *Session) PollInFlight() int32 {
-	return s.pollInFlight.Load()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pollInFlight
 }
 
 // Meta returns a copy of the metadata the client declared at connect time,
