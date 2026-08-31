@@ -218,6 +218,23 @@ func TestWebSocketSessionCloseIsNoticedPromptly(t *testing.T) {
 	}
 }
 
+func TestConditionalCloseRejectsLiveWebSocketThenClosesAfterDisconnect(t *testing.T) {
+	ts, st := newWebSocketTestServer(t, testWebSocketServerConfig(), Hooks{})
+	cr := connectOKWebSocket(t, ts)
+	s, _ := st.Get(cr.SessionID)
+	ws := dialWS(t, ts, cr.SessionID)
+	waitFor(t, time.Second, func() bool { return s.PollInFlight() == 1 })
+
+	if CloseSessionIfNoPollInFlight(st, Hooks{}, s, ReasonServerClose) {
+		t.Fatal("closed a session with a websocket attached")
+	}
+	ws.CloseNow()
+	waitFor(t, time.Second, func() bool { return s.PollInFlight() == 0 })
+	if !CloseSessionIfNoPollInFlight(st, Hooks{}, s, ReasonServerClose) {
+		t.Fatal("close failed after websocket disconnected")
+	}
+}
+
 func TestWebSocketDoubleAttachIsRejected(t *testing.T) {
 	ts, _ := newWebSocketTestServer(t, testWebSocketServerConfig(), Hooks{})
 	cr := connectOKWebSocket(t, ts)

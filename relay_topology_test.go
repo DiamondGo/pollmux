@@ -1170,5 +1170,12 @@ func TestStoreReflectsLiveSessionsForStatus(t *testing.T) {
 	}
 
 	cancel()
-	waitFor(t, 15*time.Second, func() bool { return b.store.Len() == 0 })
+	// ReconnectLoop cancellation stops transport activity, but it does not send
+	// DELETE: production servers remove these sessions through their normal
+	// shutdown/expiry path. Exercise graceful shutdown explicitly so this test
+	// does not depend on a 60-second sweeper timeout.
+	for _, s := range b.store.All() {
+		CloseSession(b.store, b.hooks, s, ReasonServerClose)
+	}
+	waitFor(t, 5*time.Second, func() bool { return b.store.Len() == 0 })
 }

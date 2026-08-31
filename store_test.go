@@ -92,7 +92,9 @@ func TestSweeperEvictsIdleSession(t *testing.T) {
 func TestSweeperSkipsSessionWithPollInFlight(t *testing.T) {
 	st := NewSessionStore()
 	s := newSession("polling", nil)
-	s.pollInFlight.Add(1)
+	if !s.beginPoll() {
+		t.Fatal("beginPoll failed")
+	}
 	st.add(s)
 
 	evicted := make(chan *Session, 1)
@@ -112,7 +114,7 @@ func TestSweeperSkipsSessionWithPollInFlight(t *testing.T) {
 	}
 
 	// Once the poll returns, the normal idle rule applies again.
-	s.pollInFlight.Add(-1)
+	s.endPoll()
 	select {
 	case got := <-evicted:
 		if got != s {

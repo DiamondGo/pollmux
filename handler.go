@@ -370,6 +370,11 @@ func PollHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 			return
 		}
 
+		if !s.beginPoll() {
+			writeError(w, http.StatusGone, "session closed")
+			return
+		}
+		defer s.endPoll()
 		s.touch()
 
 		// Before the wait, not after: a callback that runs after a 30-second
@@ -421,12 +426,6 @@ func PollHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 			return
 		}
 
-		// A parked poll is proof the client is still there, and the count
-		// drops the moment this handler returns — including when the TCP
-		// connection breaks underneath it.
-		s.pollInFlight.Add(1)
-		defer s.pollInFlight.Add(-1)
-
 		buf := make([]byte, cfg.PollBufferSize)
 		n, err := s.toClient.ReadAvailable(buf, cfg.PollTimeout, cfg.CoalesceWindow)
 
@@ -466,8 +465,7 @@ func pollStream(w http.ResponseWriter, r *http.Request, s *Session, cfg ServerCo
 		return
 	}
 
-	s.pollInFlight.Add(1)
-	defer s.pollInFlight.Add(-1)
+	// PollHandler owns the lifecycle attachment for this request.
 
 	// Headers must go out now, not on the first frame. The client's
 	// ResponseHeaderTimeout for a stream-mode poll is short (it only needs
@@ -534,8 +532,7 @@ func pollStream(w http.ResponseWriter, r *http.Request, s *Session, cfg ServerCo
 // is safely between frames (see DESIGN.md's "谁来决定轮转" section). This
 // handler just reads until told to stop.
 func pollSendStream(w http.ResponseWriter, r *http.Request, s *Session, cfg ServerConfig) {
-	s.pollInFlight.Add(1)
-	defer s.pollInFlight.Add(-1)
+	// PollHandler owns the lifecycle attachment for this request.
 
 	// A read-idle watchdog is this handler's only liveness signal: unlike
 	// pollStream (where the server is the writer and controls the pace
@@ -641,12 +638,27 @@ func CloseSession(st *SessionStore, h Hooks, s *Session, reason DisconnectReason
 }
 
 func closeSession(st *SessionStore, h Hooks, s *Session, reason DisconnectReason) {
-	st.Remove(s.ID)
-	// closeOnce is the guard: exactly one caller gets true, so a delete racing
-	// an eviction cannot fire OnDisconnect twice.
-	if s.closeOnce() && h.OnDisconnect != nil {
+	if !st.removeAndMarkClosed(s, false) {
+		return
+	}
+	s.closePipes()
+	if h.OnDisconnect != nil {
 		h.OnDisconnect(s, reason)
 	}
+}
+
+// CloseSessionIfNoPollInFlight atomically closes s only when it is still the
+// current store entry and no poll or persistent transport is attached. It
+// returns true only when this call completed the removal and close.
+func CloseSessionIfNoPollInFlight(st *SessionStore, h Hooks, s *Session, reason DisconnectReason) bool {
+	if !st.removeAndMarkClosed(s, true) {
+		return false
+	}
+	s.closePipes()
+	if h.OnDisconnect != nil {
+		h.OnDisconnect(s, reason)
+	}
+	return true
 }
 
 // StartSweeper runs the store's expiry scan with this config's timings, wired

@@ -93,14 +93,15 @@ func TestSessionPollInFlightCounts(t *testing.T) {
 		t.Fatalf("PollInFlight = %d on a fresh session, want 0", got)
 	}
 
-	s.pollInFlight.Add(1)
-	s.pollInFlight.Add(1)
+	if !s.beginPoll() || !s.beginPoll() {
+		t.Fatal("beginPoll failed on an open session")
+	}
 	if got := s.PollInFlight(); got != 2 {
 		t.Fatalf("PollInFlight = %d, want 2", got)
 	}
 
-	s.pollInFlight.Add(-1)
-	s.pollInFlight.Add(-1)
+	s.endPoll()
+	s.endPoll()
 	if got := s.PollInFlight(); got != 0 {
 		t.Fatalf("PollInFlight = %d after both polls returned, want 0", got)
 	}

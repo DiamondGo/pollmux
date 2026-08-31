@@ -114,6 +114,7 @@ func (f *fakeServer) serveConnect(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&req)
 	f.mu.Lock()
 	f.connects = append(f.connects, req)
+	sessionID := f.sessionID
 	f.mu.Unlock()
 
 	for k, v := range f.connectHeader {
@@ -131,7 +132,7 @@ func (f *fakeServer) serveConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := ConnectResponse{
 		ProtocolVersion: ProtocolVersion,
-		SessionID:       f.sessionID,
+		SessionID:       sessionID,
 		Limits:          f.limits,
 		Meta:            f.connectMeta,
 	}
@@ -578,13 +579,19 @@ func TestPoll410IgnoredWhenSessionSuperseded(t *testing.T) {
 	f := newFakeServer(t)
 	connector := f.connector()
 
+	f.mu.Lock()
 	f.sessionID = "sess-a"
+	f.mu.Unlock()
 	conn1 := mustConnect(t, connector)
 
+	f.mu.Lock()
 	f.sessionID = "sess-b"
+	f.mu.Unlock()
 	conn2 := mustConnect(t, connector)
 
+	f.mu.Lock()
 	f.goneSessions = map[string]struct{}{"sess-a": {}}
+	f.mu.Unlock()
 
 	select {
 	case <-conn1.SessionSuperseded():
