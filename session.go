@@ -55,8 +55,11 @@ type Session struct {
 	// assuming the caller never will.
 	wsAttached bool
 
-	// pollInFlight counts long polls currently parked in the handler. A value
-	// above zero means a TCP connection is being held open by this client right
+	// pollInFlight counts active poll requests and persistent transports attached
+	// to the session, including send-only requests, stream requests before they
+	// park, and WebSocket attachments. A nonzero value means a client transport
+	// is currently attached and prevents eviction; it does not necessarily mean
+	// a long poll is parked.
 	// now, so the session is demonstrably alive and must not be evicted — and
 	// when that TCP connection does break, the handler returns and the count
 	// drops immediately, which is what turns a silent client death into a fast
