@@ -131,7 +131,7 @@ WebSocket 是绕开这个问题的正确层：Cloudflare（以及几乎所有反
 
 **什么时候会放弃恢复、退化成今天的"新建会话"**（客户端 `TransportFailed` 触发、`ReconnectLoop` 照旧转一圈）：宽限期内没能完成 `/resume`（服务端回 404/410，或客户端按下发的 `resume_grace_ms` 重试用尽）；服务端主动关闭了会话（410 / `frameGone`，比如对端离开、被 DELETE）；任一方向重放缓冲超过 `MaxReplayBytes`（默认 16MB，两端各自独立配置，超过后会话继续在当前传输上工作但不再可恢复）；offset 越界或出现空洞（这是 bug 信号，宁可重建也绝不错误重放）；`UploadStreamPreference` 自动探测失败——上行退回离散 POST 就没法续传，客户端会删掉这个会话、不带 `PreferResume` 重连一次，调用方拿到的是一个普通连接。
 
-**要注意的两件事**：一，**两跳都要开**。consumer↔broker 与 provider↔broker 任一跳不可恢复，那一跳断裂时流照样死。二，恢复窗口是内存放大面：脱离的会话在宽限期内持有 `*Session` 加最多 `MaxReplayBytes` 的重放缓冲。`ResumeGrace` 有硬上限，`ServerConfig.MaxDetachedResumable`（默认 1024）封顶同时处于脱离状态的可恢复会话数、超出时 sweeper 先淘汰脱离最久的，`/resume` 只认 128 位随机 session id、和 poll/delete 同一信任边界（把它挂在同一层鉴权中间件后面）。
+**要注意的两件事**：一，**两跳都要开**。consumer↔broker 与 provider↔broker 任一跳不可恢复，那一跳断裂时流照样死。二，恢复窗口是内存放大面：脱离的会话在宽限期内持有 `*Session` 加最多 `MaxReplayBytes` 的重放缓冲。`ResumeGrace` 有硬上限，`ServerConfig.MaxDetachedResumable`（默认 1024）封顶同时处于脱离状态的可恢复会话数、超出时 sweeper 先淘汰脱离最久的。三，**`/resume` 必须挂在与 `/poll`、`DELETE`、`/ws` 完全相同的鉴权中间件后面**。库本身对这几个端点都不调用 `Hooks.Authenticate`（它绑定的是 `ConnectRequest`），信任边界是 128 位随机 session id 加应用自己的中间件。一个带着越界 `recv_offset` 的 `/resume` 会让该会话永久失去可恢复性（409）——这是故意的：只拒绝不标记的话，状态错乱的对端可以换几个 offset 反复试到落进可重放区间，那就是"错误重放"，比断流严重得多；诚实的客户端收到 409 本来也会放弃这个会话。能打到这个端点的人同样能直接 `DELETE` 会话，所以它没有引入 session id 本身没有的能力，但前提是鉴权层没有漏掉它。
 
 `/resume` 的状态码：200 恢复成功（响应体带服务端的 `recv_offset`）；404 会话不存在、410 已关闭、409 不可恢复（未协商、已判定不可恢复、offset 超出可重放范围——客户端一律放弃并重建）；426 协议版本；503 稍后重试（旧传输还没脱离干净，或另一个 resume 正在进行）。
 

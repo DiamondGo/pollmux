@@ -181,6 +181,21 @@ func (a *attachments) endResume() {
 // is refused with 409, and the client falls back to a fresh session rather
 // than resuming with the wrong bytes.
 //
+// An offset outside [acked, sent] does more than fail the request: it ends
+// the session's resumability for good. Refusing alone would let a peer
+// whose state has drifted try other offsets until one happens to land
+// inside the range, and resuming from a guessed offset is exactly the
+// silent corruption this whole layer exists to rule out. The honest peer
+// loses nothing by this — after a 409 it abandons the session anyway.
+//
+// Authorization is the same as PollHandler, DeleteHandler and
+// WebSocketHandler's: the 128-bit random session id in the path, plus
+// whatever middleware the application puts in front of all of them. Mount
+// this handler behind the very same middleware — a caller who can reach it
+// unauthenticated could break a session's resumability, though note that
+// the same caller could already DELETE the session outright, so the
+// endpoint adds no capability the id did not already confer.
+//
 // Status codes: 200 resumed; 404 unknown session; 409 cannot be resumed
 // (not negotiated, broken, or an offset out of range — give up); 410 closed;
 // 426 protocol version; 503 try again shortly (a previous transport is
