@@ -2,6 +2,7 @@ package pollmux
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +30,16 @@ func wsEncode(typ frameType, payload []byte) []byte {
 	msg := make([]byte, 1+len(payload))
 	msg[0] = byte(typ)
 	copy(msg[1:], payload)
+	return msg
+}
+
+// wsEncodeSeq is wsEncode for a frameSeqData message: type tag, 8-byte
+// offset, data.
+func wsEncodeSeq(off uint64, payload []byte) []byte {
+	msg := make([]byte, 1+seqHeaderLen+len(payload))
+	msg[0] = byte(frameSeqData)
+	binary.BigEndian.PutUint64(msg[1:], off)
+	copy(msg[1+seqHeaderLen:], payload)
 	return msg
 }
 
@@ -63,6 +74,33 @@ func WebSocketHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler 
 			writeError(w, http.StatusBadRequest, "session was not negotiated for websocket transport")
 			return
 		}
+
+		// A resumable session lets a new WebSocket displace a stale one —
+		// the client only dials again after its previous connection died,
+		// and this server may not have noticed that yet — instead of
+		// answering 409 (see attachments). The claim is taken before
+		// beginWebSocket, and released after endWebSocket, so that by the
+		// time a kicked handler's done channel closes its wsAttached flag
+		// is already clear for the newcomer. The kick closes the
+		// connection (failing whichever pump is inside Read/Write) and
+		// interrupts the write pump's pipe wait.
+		var att *attachment
+		var wsRef atomic.Pointer[websocket.Conn]
+		if s.rs != nil {
+			var err error
+			att, err = s.att.attach(attachBoth, func() {
+				if c := wsRef.Load(); c != nil {
+					c.CloseNow()
+				}
+				s.rs.interruptOut()
+			})
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, "previous transport is still detaching, retry")
+				return
+			}
+			defer s.att.detach(att)
+		}
+
 		if !s.beginWebSocket() {
 			if s.IsClosed() {
 				writeError(w, http.StatusGone, "session closed")
@@ -86,7 +124,18 @@ func WebSocketHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler 
 			// Accept already wrote the HTTP error response.
 			return
 		}
-		c.SetReadLimit(int64(cfg.MaxSendBytes) + 1) // +1 for wsEncode's type byte
+		c.SetReadLimit(int64(cfg.MaxSendBytes) + 1 + seqHeaderLen) // +1 for wsEncode's type byte, +8 for a seq-data offset
+		if s.rs != nil {
+			wsRef.Store(c)
+			// A kick that landed between attach and Accept found no
+			// connection to close; honour it now rather than sit in Read
+			// until the kicker gives up.
+			if !s.att.isCurrent(att) {
+				c.CloseNow()
+				return
+			}
+			s.rs.resetAck()
+		}
 
 		// Not r.Context(): coder/websocket's Accept doc warns that using the
 		// request context after Accept returns "may lead to unexpected
@@ -108,7 +157,7 @@ func WebSocketHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler 
 		readErrCh := make(chan error, 1)
 		writeErrCh := make(chan error, 1)
 		go func() { defer wg.Done(); readErrCh <- wsReadPump(ctx, c, s, idle) }()
-		go func() { defer wg.Done(); writeErrCh <- wsWritePump(ctx, c, s, cfg, idle) }()
+		go func() { defer wg.Done(); writeErrCh <- wsWritePump(ctx, c, s, cfg, idle, att) }()
 
 		// Whichever pump ends first decides the outcome and closing c below
 		// is what unblocks whichever pump is still running — a read or
@@ -162,10 +211,38 @@ func wsReadPump(ctx context.Context, c *websocket.Conn, s *Session, idle time.Du
 		}
 		switch ft {
 		case frameData:
+			if s.rs != nil {
+				// Unnumbered data would silently desync the upstream
+				// count; a resumable client never sends it.
+				s.rs.markBroken()
+				return errors.New("pollmux: unnumbered data frame on a resumable session")
+			}
 			if len(payload) > 0 {
 				if _, err := s.writeUpstream(payload); err != nil {
 					return err
 				}
+			}
+		case frameSeqData:
+			if s.rs == nil {
+				return errors.New("pollmux: seq-data frame on a non-resumable session")
+			}
+			off, data, err := splitSeq(payload)
+			if err == nil {
+				err = s.rs.recvIn(off, data)
+			}
+			if err != nil {
+				return err
+			}
+		case frameAck:
+			if s.rs == nil {
+				return errors.New("pollmux: ack frame on a non-resumable session")
+			}
+			n, err := decodeAck(payload)
+			if err == nil {
+				err = s.rs.ack(n)
+			}
+			if err != nil {
+				return err
 			}
 		case frameHeartbeat:
 			// Liveness only.
@@ -181,7 +258,10 @@ func wsReadPump(ctx context.Context, c *websocket.Conn, s *Session, idle time.Du
 // "nothing to send" into a heartbeat frame on the same cadence pollStream
 // already uses, so the peer's read-idle watchdog never has reason to fire
 // while this session is merely quiet rather than dead.
-func wsWritePump(ctx context.Context, c *websocket.Conn, s *Session, cfg ServerConfig, idle time.Duration) error {
+func wsWritePump(ctx context.Context, c *websocket.Conn, s *Session, cfg ServerConfig, idle time.Duration, att *attachment) error {
+	if s.rs != nil {
+		return wsWritePumpResumable(ctx, c, s, cfg, idle, att)
+	}
 	buf := make([]byte, cfg.PollBufferSize)
 	for {
 		n, err := s.toClient.ReadAvailable(buf, cfg.HeartbeatInterval, cfg.CoalesceWindow)
@@ -194,6 +274,49 @@ func wsWritePump(ctx context.Context, c *websocket.Conn, s *Session, cfg ServerC
 			err = c.Write(wctx, websocket.MessageBinary, wsEncode(frameData, buf[:n]))
 		} else {
 			err = c.Write(wctx, websocket.MessageBinary, wsEncode(frameHeartbeat, nil))
+		}
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// errDetached is wsWritePumpResumable's report that a newer WebSocket took
+// over the session while this one was parked: leave without touching the
+// pipe again.
+var errDetached = errors.New("pollmux: transport detached by a newer attachment")
+
+// wsWritePumpResumable is wsWritePump for a resumable session: the same
+// three changes pollStreamResumable makes to pollStream — bytes come from
+// the reliable layer as numbered frames, every write is preceded by any due
+// ack, and an interrupted wait means either "replaced" or "ack now".
+func wsWritePumpResumable(ctx context.Context, c *websocket.Conn, s *Session, cfg ServerConfig, idle time.Duration, att *attachment) error {
+	buf := make([]byte, cfg.PollBufferSize)
+	for {
+		off, n, err := s.rs.nextOut(buf, cfg.HeartbeatInterval, cfg.CoalesceWindow)
+		interrupted := false
+		switch {
+		case errors.Is(err, io.EOF):
+			return io.EOF
+		case errors.Is(err, errPipeInterrupted):
+			if !s.att.isCurrent(att) {
+				return errDetached
+			}
+			interrupted = true
+		}
+
+		wctx, cancel := context.WithTimeout(ctx, idle)
+		if ack, due := s.rs.takeAck(); due {
+			err = c.Write(wctx, websocket.MessageBinary, wsEncode(frameAck, encodeOffset(ack)))
+		}
+		if err == nil {
+			switch {
+			case n > 0:
+				err = c.Write(wctx, websocket.MessageBinary, wsEncodeSeq(off, buf[:n]))
+			case !interrupted:
+				err = c.Write(wctx, websocket.MessageBinary, wsEncode(frameHeartbeat, nil))
+			}
 		}
 		cancel()
 		if err != nil {

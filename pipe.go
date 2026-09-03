@@ -30,6 +30,15 @@ type BufferedPipe struct {
 	warnThreshold int
 	warned        bool
 	logger        *slog.Logger
+
+	// intr is a level-triggered interrupt flag for ReadAvailable, set by
+	// interrupt and consumed by the next ReadAvailable call. The resumable
+	// transport (see reliable.go) uses it for two things that both need to
+	// pull a parked writer out of its long wait early: kicking a stale
+	// attachment off a session so a replacement can attach, and nudging
+	// the writer to send an acknowledgement when enough data has arrived.
+	// Read is deliberately unaffected — it has no timeout to cut short.
+	intr bool
 }
 
 // NewBufferedPipe creates a new BufferedPipe ready for use.
@@ -135,7 +144,14 @@ func (p *BufferedPipe) Read(dst []byte) (int, error) {
 // answers 204. Returns io.EOF if the pipe is closed and empty, which the caller
 // must distinguish from that timeout: it means the session is gone, and
 // answering 204 there would leave the client polling an empty session until its
-// own timeout instead of reconnecting (A5).
+// own timeout instead of reconnecting (A5). Returns (0, errPipeInterrupted)
+// if interrupt was called; only the resumable transport ever does that, so
+// every other caller keeps seeing exactly the three outcomes above. An
+// interrupted return says nothing about the pipe's contents — data may
+// well be buffered (an interrupt that lands during the coalesce window is
+// reported on the *following* call, after that call's data has been
+// returned) — so a caller must treat it purely as "re-check your state and
+// call again", never as "the pipe is empty".
 func (p *BufferedPipe) ReadAvailable(dst []byte, timeout time.Duration, coalesceWindow time.Duration) (int, error) {
 	if coalesceWindow <= 0 {
 		coalesceWindow = DefaultCoalesceWindow
@@ -144,12 +160,21 @@ func (p *BufferedPipe) ReadAvailable(dst []byte, timeout time.Duration, coalesce
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// A pending interrupt wins over everything, including data already
+	// buffered: the interrupter wants the caller back in its own loop now
+	// (to notice it has been detached, or to send an ack), and the data is
+	// still here for the next call.
+	if p.intr {
+		p.intr = false
+		return 0, errPipeInterrupted
+	}
+
 	if len(p.buf) == 0 {
 		if p.closed {
 			return 0, io.EOF
 		}
 
-		// Phase 1: wait for the first byte (or timeout/close).
+		// Phase 1: wait for the first byte (or timeout/close/interrupt).
 		timedOut := false
 		timer := time.AfterFunc(timeout, func() {
 			p.mu.Lock()
@@ -157,7 +182,7 @@ func (p *BufferedPipe) ReadAvailable(dst []byte, timeout time.Duration, coalesce
 			p.cond.Broadcast()
 			p.mu.Unlock()
 		})
-		for len(p.buf) == 0 && !p.closed && !timedOut {
+		for len(p.buf) == 0 && !p.closed && !timedOut && !p.intr {
 			p.cond.Wait()
 		}
 		timer.Stop()
@@ -166,14 +191,20 @@ func (p *BufferedPipe) ReadAvailable(dst []byte, timeout time.Duration, coalesce
 			if p.closed {
 				return 0, io.EOF
 			}
+			if p.intr {
+				p.intr = false
+				return 0, errPipeInterrupted
+			}
 			return 0, nil // pure timeout, no data at all
 		}
 	}
 
 	// Phase 2: at least one byte is available. Give it a brief window to
 	// accumulate more before flushing, unless dst is already full or the pipe
-	// closed in the meantime.
-	if len(p.buf) < len(dst) && !p.closed {
+	// closed in the meantime. An interrupt cuts the window short but does not
+	// consume the flag — the data goes back first, and the very next call
+	// returns errPipeInterrupted, so the interrupt is still handled promptly.
+	if len(p.buf) < len(dst) && !p.closed && !p.intr {
 		timedOut := false
 		timer := time.AfterFunc(coalesceWindow, func() {
 			p.mu.Lock()
@@ -181,7 +212,7 @@ func (p *BufferedPipe) ReadAvailable(dst []byte, timeout time.Duration, coalesce
 			p.cond.Broadcast()
 			p.mu.Unlock()
 		})
-		for len(p.buf) < len(dst) && !p.closed && !timedOut {
+		for len(p.buf) < len(dst) && !p.closed && !timedOut && !p.intr {
 			p.cond.Wait()
 		}
 		timer.Stop()
@@ -190,6 +221,20 @@ func (p *BufferedPipe) ReadAvailable(dst []byte, timeout time.Duration, coalesce
 	n := copy(dst, p.buf)
 	p.buf = p.buf[n:]
 	return n, nil
+}
+
+// interrupt makes the current or next ReadAvailable call return
+// errPipeInterrupted instead of waiting out its timeout. It is level-
+// triggered: a call that lands while no reader is parked is remembered and
+// consumed by the next ReadAvailable, so a writer that was busy between two
+// calls still sees it promptly. A spurious interrupt is harmless to every
+// caller in this package — each one re-checks its own state and simply calls
+// ReadAvailable again — which is what makes the flag safe to leave pending.
+func (p *BufferedPipe) interrupt() {
+	p.mu.Lock()
+	p.intr = true
+	p.cond.Broadcast()
+	p.mu.Unlock()
 }
 
 // Close closes the pipe, unblocking any waiting readers. Idempotent.

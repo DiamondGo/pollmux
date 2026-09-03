@@ -113,6 +113,28 @@ WebSocket 是绕开这个问题的正确层：Cloudflare（以及几乎所有反
 
 **依赖**：`go.mod` 新增 `github.com/coder/websocket`。选它是因为 API 是 context-native 的（`Read(ctx)`/`Write(ctx, ...)`），和这个库本身大量用 context 做超时/取消的风格一致；没有引入额外的传递依赖。
 
+### 六、跨重连会话恢复（`PreferResume` / `EnableResume`）
+
+前五节解决的都是"链路健康时怎么跑得快、跑得稳"。这一节解决另一类问题：**链路被外部按存活时间掐断时，隧道上的流为什么必死、以及怎么让它不死**。
+
+默认模型下，底层传输（poll / send-stream / WebSocket）一断，客户端就丢弃整个 yamux 会话，下一轮 `Connect` 拿到的是一个全新 session id，旧会话里所有 stream（比如一条 SSH 的 TCP 流）随之被切断。生产上 consumer 与 provider 各有一条传输经过 Cloudflare/反向代理，任意一条被中间层的最大连接存活时间（观察到约一小时）掐断，SSH 就断一次。心跳、`StreamMaxDuration` 滚动这些秒级机制保护不了这件事——它们不是原因。
+
+开启方式：服务端 `ServerConfig.EnableResume = true` 并**挂载 `ResumeHandler`**（`POST {prefix}/{id}/resume`），客户端 `Connector.PreferResume = true`。协商仍是"客户端请求 && 服务端支持"的纯附加模式，`ConnectRequest.PreferResume` / `ConnectResponse.Resumable`，`ProtocolVersion` 不变，老客户端 × 新服务端、新客户端 × 老服务端都退化为今天的行为。**只有两种传输能恢复**：WebSocket，或上下行都是流式（`PollMode = "stream"` 且上行也谈成 stream）。batch 一个响应即一条消息，接缝语义太弱，`EnableResume` 与 batch 组合时 `Resumable` 直接为 false。
+
+**它做了什么**：在 yamux 与 pollmux 传输之间插了一层可靠续传层（`reliable.go`），两端共用同一份实现——
+
+- 每方向给数据字节编累积序号（和 TCP 一样按字节计），数据帧改用带 8 字节绝对 offset 的 `frameSeqData`，对端收到后用 `frameAck(offset)` 回确认。ACK 搭载在反向数据/心跳帧上，收满半个 yamux 窗口还会主动叫醒发送方立刻发一次，正常运行不多花 RTT。
+- 已发未确认的字节留在重放缓冲里。传输断开后，客户端不再新建会话，而是 `POST /{id}/resume` 交换双方各自"已连续收到多少字节"，服务端把下行重放缓冲回退到客户端声明的位置，客户端把上行缓冲回退到服务端声明的位置，新传输附着后先重放缺口、再继续。接收方按 offset 去重：重放过来的、已经收到过的字节丢掉，出现空洞则判定不可恢复。**接缝处无丢失、无重复、严格保序**，否则 yamux 帧流一错位整条会话就废了。
+- yamux **只构建一次**。瞬断期间 `Read` 阻塞、`Write` 立即返回（字节编号后进缓冲），yamux 从不卡在底层写上，所以 `ConnectionWriteTimeout` 不会触发；对端的窗口更新也发不过来，yamux 自己的流控让每条 stream 最多再写约 `MaxStreamWindowSize`（256KB）就停手，重放缓冲因此天然封顶在"256KB × 活跃流数"。
+- 服务端的 `*Session` 本来就跨请求存活；现在传输脱离后它进入宽限期（`ServerConfig.ResumeGrace`，默认 30s，上限 `MaxResumeGrace` 5 分钟），期间不被 `SessionTimeout` 淘汰，`CloseSessionIfNoPollInFlight` 也会把它当成"仍有传输附着"而拒绝关闭——所以一个周期性调用它的 fast reaper（HttpBroker 那种）**不需要任何改动**，宽限期一过它自然返回 true。`Session.Resumable()` / `Session.ResumeDeadline()` 供状态页和 reaper 观察。
+- 应用侧无感：HttpBroker 的 `ServerSession(session)` / `ClientSession(conn)` / `bridgeStream` 的 `io.Copy` 一行不改，只加配置。
+
+**什么时候会放弃恢复、退化成今天的"新建会话"**（客户端 `TransportFailed` 触发、`ReconnectLoop` 照旧转一圈）：宽限期内没能完成 `/resume`（服务端回 404/410，或客户端按下发的 `resume_grace_ms` 重试用尽）；服务端主动关闭了会话（410 / `frameGone`，比如对端离开、被 DELETE）；任一方向重放缓冲超过 `MaxReplayBytes`（默认 16MB，两端各自独立配置，超过后会话继续在当前传输上工作但不再可恢复）；offset 越界或出现空洞（这是 bug 信号，宁可重建也绝不错误重放）；`UploadStreamPreference` 自动探测失败——上行退回离散 POST 就没法续传，客户端会删掉这个会话、不带 `PreferResume` 重连一次，调用方拿到的是一个普通连接。
+
+**要注意的两件事**：一，**两跳都要开**。consumer↔broker 与 provider↔broker 任一跳不可恢复，那一跳断裂时流照样死。二，恢复窗口是内存放大面：脱离的会话在宽限期内持有 `*Session` 加最多 `MaxReplayBytes` 的重放缓冲。`ResumeGrace` 有硬上限，`ServerConfig.MaxDetachedResumable`（默认 1024）封顶同时处于脱离状态的可恢复会话数、超出时 sweeper 先淘汰脱离最久的。三，**`/resume` 必须挂在与 `/poll`、`DELETE`、`/ws` 完全相同的鉴权中间件后面**。库本身对这几个端点都不调用 `Hooks.Authenticate`（它绑定的是 `ConnectRequest`），信任边界是 128 位随机 session id 加应用自己的中间件。一个带着越界 `recv_offset` 的 `/resume` 会让该会话永久失去可恢复性（409）——这是故意的：只拒绝不标记的话，状态错乱的对端可以换几个 offset 反复试到落进可重放区间，那就是"错误重放"，比断流严重得多；诚实的客户端收到 409 本来也会放弃这个会话。能打到这个端点的人同样能直接 `DELETE` 会话，所以它没有引入 session id 本身没有的能力，但前提是鉴权层没有漏掉它。
+
+`/resume` 的状态码：200 恢复成功（响应体带服务端的 `recv_offset`）；404 会话不存在、410 已关闭、409 不可恢复（未协商、已判定不可恢复、offset 超出可重放范围——客户端一律放弃并重建）；426 协议版本；503 稍后重试（旧传输还没脱离干净，或另一个 resume 正在进行）。
+
 ---
 
 ## 协议与行为约定

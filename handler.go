@@ -100,6 +100,38 @@ type ServerConfig struct {
 	// difference.
 	EnableWebSocket bool
 
+	// EnableResume lets ConnectHandler negotiate a resumable session for a
+	// client that sends PreferResume: the session and the yamux session on
+	// top of it survive the transport breaking, as long as the client
+	// resumes (see ResumeHandler) within ResumeGrace. Only WebSocket
+	// transport and stream mode in both directions can be resumed; a batch
+	// negotiation ignores this. A client that does not ask, or a server
+	// with this left false, is completely unaffected. Mount ResumeHandler
+	// when turning this on.
+	EnableResume bool
+
+	// ResumeGrace is how long a resumable session survives with no
+	// transport attached, waiting to be resumed. Defaults to
+	// DefaultResumeGrace; capped at MaxResumeGrace (check panics above it).
+	// This replaces SessionTimeout as the eviction criterion for a
+	// resumable session that is detached; an attached one is never evicted,
+	// as today.
+	ResumeGrace time.Duration
+
+	// MaxReplayBytes caps how much unacknowledged data each direction of a
+	// resumable session retains for replay. Beyond it the session stops
+	// being resumable (it keeps working over its current transport, and
+	// the next transport failure ends it like a non-resumable session
+	// would). Defaults to DefaultMaxReplayBytes.
+	MaxReplayBytes int
+
+	// MaxDetachedResumable caps how many resumable sessions may be waiting
+	// detached at once, bounding the memory a burst of disconnects — or a
+	// client that connects and vanishes on purpose — can hold. The sweeper
+	// evicts the longest-detached first. Defaults to
+	// DefaultMaxDetachedResumable; negative disables the cap.
+	MaxDetachedResumable int
+
 	// Logger receives diagnostics. Nil disables logging.
 	Logger *slog.Logger
 }
@@ -128,6 +160,15 @@ func (cfg ServerConfig) withDefaults() ServerConfig {
 	}
 	if cfg.StreamMaxDuration <= 0 {
 		cfg.StreamMaxDuration = DefaultStreamMaxDuration
+	}
+	if cfg.ResumeGrace <= 0 {
+		cfg.ResumeGrace = DefaultResumeGrace
+	}
+	if cfg.MaxReplayBytes <= 0 {
+		cfg.MaxReplayBytes = DefaultMaxReplayBytes
+	}
+	if cfg.MaxDetachedResumable == 0 {
+		cfg.MaxDetachedResumable = DefaultMaxDetachedResumable
 	}
 	if cfg.SessionIDFunc == nil {
 		cfg.SessionIDFunc = func(r *http.Request) string { return r.PathValue("id") }
@@ -161,11 +202,16 @@ func (cfg ServerConfig) check() {
 			"the stream would barely open before being forced to end",
 			cfg.StreamMaxDuration, 2*cfg.HeartbeatInterval))
 	}
+	if cfg.ResumeGrace > MaxResumeGrace {
+		panic(fmt.Sprintf("pollmux: ServerConfig.ResumeGrace=%v exceeds MaxResumeGrace=%v; "+
+			"a detached resumable session holds its replay buffer for the whole grace",
+			cfg.ResumeGrace, MaxResumeGrace))
+	}
 }
 
 // limits is what gets handed down to clients at connect time for the given
 // negotiated mode.
-func (cfg ServerConfig) limits(mode string) Limits {
+func (cfg ServerConfig) limits(mode string, resumable bool) Limits {
 	l := Limits{
 		MaxSendBytes:     cfg.MaxSendBytes,
 		PollTimeoutMS:    cfg.PollTimeout.Milliseconds(),
@@ -175,6 +221,9 @@ func (cfg ServerConfig) limits(mode string) Limits {
 	if mode == PollModeStream {
 		l.HeartbeatIntervalMS = cfg.HeartbeatInterval.Milliseconds()
 		l.StreamMaxDurationMS = cfg.StreamMaxDuration.Milliseconds()
+	}
+	if resumable {
+		l.ResumeGraceMS = cfg.ResumeGrace.Milliseconds()
 	}
 	return l
 }
@@ -300,6 +349,19 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 		s.pollMode = negotiatedMode
 		s.watchHighWater(cfg.HighWaterWarn, cfg.Logger)
 
+		// Decided here, before the session is published, because
+		// PollHandler/WebSocketHandler read s.rs without a lock — the same
+		// immutable-after-publish discipline pollMode and transport follow.
+		transport := ""
+		if cfg.EnableWebSocket && req.PreferWebSocket {
+			transport = TransportWebSocket
+		}
+		s.transport = transport
+		resumable := negotiateResume(cfg, req, transport, negotiatedMode, negotiatedUpload)
+		if resumable {
+			s.enableResume(cfg.MaxReplayBytes, cfg.ResumeGrace)
+		}
+
 		// Register before the callback. The client's first poll can beat
 		// OnConnect to the server, and it must find the session waiting.
 		st.add(s)
@@ -314,7 +376,7 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 			}
 		}
 
-		cfg.Logger.Info("pollmux: session created", "session_id", id)
+		cfg.Logger.Info("pollmux: session created", "session_id", id, "resumable", resumable)
 
 		uploadStreamMode := ""
 		// limitsMode drives whether cfg.limits() includes the
@@ -331,23 +393,19 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 		// still rides limitsMode's Heartbeat field (WebSocketHandler uses it
 		// for the app-level heartbeat cadence, see websocket.go) but never
 		// needs StreamMaxDuration — see ServerConfig.StreamMaxDuration.
-		transport := ""
-		if cfg.EnableWebSocket && req.PreferWebSocket {
-			transport = TransportWebSocket
-			if limitsMode != PollModeStream {
-				limitsMode = PollModeStream
-			}
+		if transport == TransportWebSocket && limitsMode != PollModeStream {
+			limitsMode = PollModeStream
 		}
-		s.transport = transport
 
 		writeJSON(w, http.StatusOK, ConnectResponse{
 			ProtocolVersion:  ProtocolVersion,
 			SessionID:        id,
-			Limits:           cfg.limits(limitsMode),
+			Limits:           cfg.limits(limitsMode, resumable),
 			Meta:             meta,
 			PollMode:         negotiatedMode,
 			UploadStreamMode: uploadStreamMode,
 			Transport:        transport,
+			Resumable:        resumable,
 		})
 	})
 }
@@ -385,6 +443,20 @@ func PollHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 
 		if r.Header.Get(HeaderSendStream) == "true" {
 			pollSendStream(w, r, s, cfg)
+			return
+		}
+
+		if s.rs != nil {
+			// A resumable session only ever negotiated stream mode in both
+			// directions (or WebSocket, which never comes through here), so
+			// the only other request shape it accepts is a receive-only
+			// stream poll. A discrete send would bypass the reliable layer's
+			// numbering and corrupt the upstream offsets.
+			if r.Header.Get(HeaderReceiveOnly) != "true" || r.Header.Get(HeaderSendOnly) == "true" {
+				writeError(w, http.StatusBadRequest, "resumable session accepts only stream requests")
+				return
+			}
+			pollStream(w, r, s, cfg)
 			return
 		}
 
@@ -467,6 +539,27 @@ func pollStream(w http.ResponseWriter, r *http.Request, s *Session, cfg ServerCo
 
 	// PollHandler owns the lifecycle attachment for this request.
 
+	// A resumable session additionally hands this handler exclusive
+	// ownership of the downstream direction, kicking any previous owner
+	// off first (see attachments). kick has to cover both places this loop
+	// can be blocked: the pipe wait (interrupt) and a write to a peer that
+	// stopped reading (a past write deadline fails it at once).
+	var att *attachment
+	if s.rs != nil {
+		rc := http.NewResponseController(w)
+		var err error
+		att, err = s.att.attach(attachDown, func() {
+			rc.SetWriteDeadline(time.Now())
+			s.rs.interruptOut()
+		})
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "previous transport is still detaching, retry")
+			return
+		}
+		defer s.att.detach(att)
+		s.rs.resetAck()
+	}
+
 	// Headers must go out now, not on the first frame. The client's
 	// ResponseHeaderTimeout for a stream-mode poll is short (it only needs
 	// to cover connection setup, not a long-poll wait) — if this handler
@@ -479,6 +572,11 @@ func pollStream(w http.ResponseWriter, r *http.Request, s *Session, cfg ServerCo
 
 	buf := make([]byte, cfg.PollBufferSize)
 	deadline := time.Now().Add(cfg.StreamMaxDuration)
+
+	if s.rs != nil {
+		pollStreamResumable(w, r, s, cfg, flusher, att, buf, deadline)
+		return
+	}
 
 	for {
 		select {
@@ -522,6 +620,68 @@ func pollStream(w http.ResponseWriter, r *http.Request, s *Session, cfg ServerCo
 	}
 }
 
+// pollStreamResumable is pollStream's loop for a resumable session. Same
+// shape — wait, frame, flush, roll over at deadline — with three
+// differences: bytes come from the reliable layer (pending replay first,
+// then the pipe) and go out as frameSeqData carrying their offset; every
+// write is preceded by an ack of what has arrived upstream since the last
+// one; and an interrupted wait means either "you have been replaced" (leave
+// quietly, a newer transport owns this direction now) or "an ack is due"
+// (send just that, no heartbeat).
+func pollStreamResumable(w http.ResponseWriter, r *http.Request, s *Session, cfg ServerConfig,
+	flusher http.Flusher, att *attachment, buf []byte, deadline time.Time) {
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		default:
+		}
+
+		off, n, err := s.rs.nextOut(buf, cfg.HeartbeatInterval, cfg.CoalesceWindow)
+		interrupted := false
+		switch {
+		case errors.Is(err, io.EOF):
+			writeFrame(w, frameGone, nil)
+			flusher.Flush()
+			return
+		case errors.Is(err, errPipeInterrupted):
+			if !s.att.isCurrent(att) {
+				return
+			}
+			interrupted = true
+		}
+
+		if ack, due := s.rs.takeAck(); due {
+			if err := writeFrame(w, frameAck, encodeOffset(ack)); err != nil {
+				cfg.Logger.Debug("pollmux: stream ack write failed, ending stream poll",
+					"session_id", s.ID, "error", err)
+				return
+			}
+		}
+		switch {
+		case n > 0:
+			if err := writeSeqFrame(w, off, buf[:n]); err != nil {
+				cfg.Logger.Debug("pollmux: stream write failed, ending stream poll",
+					"session_id", s.ID, "error", err)
+				return
+			}
+		case !interrupted:
+			if err := writeFrame(w, frameHeartbeat, nil); err != nil {
+				cfg.Logger.Debug("pollmux: stream heartbeat write failed, ending stream poll",
+					"session_id", s.ID, "error", err)
+				return
+			}
+		}
+		flusher.Flush()
+
+		if time.Now().After(deadline) {
+			writeFrame(w, frameEnd, nil)
+			flusher.Flush()
+			return
+		}
+	}
+}
+
 // pollSendStream serves the upload-stream half of PollHandler: instead of
 // reading one discrete, bounded request body and answering at once, it reads
 // a sequence of frames off the (potentially long-lived) request body and
@@ -546,6 +706,21 @@ func pollSendStream(w http.ResponseWriter, r *http.Request, s *Session, cfg Serv
 	}
 	resetDeadline()
 
+	// A resumable session hands this handler exclusive ownership of the
+	// upstream direction (see attachments); a past read deadline is what
+	// gets a kicked reader out of fr.next() immediately. The probe never
+	// carries session data, so it needs no attachment.
+	probe := r.Header.Get(HeaderSendStreamProbe) == "true"
+	resumable := s.rs != nil && !probe
+	if resumable {
+		att, err := s.att.attach(attachUp, func() { rc.SetReadDeadline(time.Now()) })
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "previous transport is still detaching, retry")
+			return
+		}
+		defer s.att.detach(att)
+	}
+
 	// A probe request (see Connector.UploadStreamPreference /
 	// probeUploadStream) carries no real session data: its frames are
 	// discarded instead of being written upstream. Otherwise it is handled
@@ -554,7 +729,6 @@ func pollSendStream(w http.ResponseWriter, r *http.Request, s *Session, cfg Serv
 	// probe exercises the identical code path and timing as production
 	// traffic rather than a bespoke fast-path that might behave differently
 	// under a buffering proxy.
-	probe := r.Header.Get(HeaderSendStreamProbe) == "true"
 
 	fr := newFrameReader(r.Body, cfg.MaxSendBytes)
 	for {
@@ -577,16 +751,56 @@ func pollSendStream(w http.ResponseWriter, r *http.Request, s *Session, cfg Serv
 
 		switch typ {
 		case frameData:
-			if len(payload) == 0 {
+			if len(payload) == 0 || probe {
 				continue
 			}
-			if probe {
-				continue
+			if resumable {
+				// Plain data has no offset and would silently desync the
+				// upstream count; a resumable client never sends it.
+				cfg.Logger.Debug("pollmux: unnumbered data frame on a resumable session", "session_id", s.ID)
+				s.rs.markBroken()
+				writeError(w, http.StatusBadRequest, "resumable session requires seq-data frames")
+				return
 			}
 			if _, err := s.writeUpstream(payload); err != nil {
 				cfg.Logger.Debug("pollmux: send-stream write failed, session is gone",
 					"session_id", s.ID, "error", err)
 				writeError(w, http.StatusGone, "session closed")
+				return
+			}
+		case frameSeqData:
+			if !resumable {
+				cfg.Logger.Debug("pollmux: seq-data frame on a non-resumable session", "session_id", s.ID)
+				writeError(w, http.StatusBadRequest, "seq-data frames require a resumable session")
+				return
+			}
+			off, data, err := splitSeq(payload)
+			if err == nil {
+				err = s.rs.recvIn(off, data)
+			}
+			if err != nil {
+				if errors.Is(err, io.ErrClosedPipe) {
+					writeError(w, http.StatusGone, "session closed")
+					return
+				}
+				cfg.Logger.Warn("pollmux: send-stream data rejected, session is no longer resumable",
+					"session_id", s.ID, "error", err)
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		case frameAck:
+			if !resumable {
+				writeError(w, http.StatusBadRequest, "ack frames require a resumable session")
+				return
+			}
+			n, err := decodeAck(payload)
+			if err == nil {
+				err = s.rs.ack(n)
+			}
+			if err != nil {
+				cfg.Logger.Warn("pollmux: send-stream ack rejected, session is no longer resumable",
+					"session_id", s.ID, "error", err)
+				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 		case frameHeartbeat:
@@ -650,6 +864,13 @@ func closeSession(st *SessionStore, h Hooks, s *Session, reason DisconnectReason
 // CloseSessionIfNoPollInFlight atomically closes s only when it is still the
 // current store entry and no poll or persistent transport is attached. It
 // returns true only when this call completed the removal and close.
+//
+// A resumable session (see ServerConfig.EnableResume) that is detached but
+// still inside its ResumeGrace also counts as attached here: its client may
+// be about to resume it. A periodic reaper that calls this after noticing a
+// transport drop therefore needs no resume-specific logic — it simply keeps
+// getting false until the grace has passed, and the sweeper evicts the
+// session at that point anyway. Session.ResumeDeadline says when.
 func CloseSessionIfNoPollInFlight(st *SessionStore, h Hooks, s *Session, reason DisconnectReason) bool {
 	if !st.removeAndMarkClosed(s, true) {
 		return false
@@ -667,6 +888,10 @@ func CloseSessionIfNoPollInFlight(st *SessionStore, h Hooks, s *Session, reason 
 func StartSweeper(st *SessionStore, cfg ServerConfig, h Hooks) (stop func()) {
 	cfg.check()
 	cfg = cfg.withDefaults()
+
+	st.mu.Lock()
+	st.maxDetachedResumable = max(cfg.MaxDetachedResumable, 0)
+	st.mu.Unlock()
 
 	return st.StartSweeper(cfg.SweepInterval, cfg.SessionTimeout, func(s *Session) {
 		cfg.Logger.Info("pollmux: evicting an idle session",

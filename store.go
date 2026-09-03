@@ -1,6 +1,7 @@
 package pollmux
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -11,6 +12,11 @@ import (
 type SessionStore struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
+
+	// maxDetachedResumable caps how many resumable sessions may sit
+	// detached at once; the sweeper evicts the longest-detached beyond it.
+	// Zero means no cap. Set by StartSweeper from ServerConfig.
+	maxDetachedResumable int
 }
 
 // NewSessionStore creates an empty store.
@@ -104,7 +110,13 @@ func (st *SessionStore) StartSweeper(interval, timeout time.Duration, onEvict fu
 }
 
 // removeAndMarkClosed removes s only if it is still the store's current object.
-// Lock order throughout lifecycle operations is SessionStore.mu -> Session.mu.
+// Lock order throughout lifecycle operations is SessionStore.mu -> Session.mu
+// (-> reliable.mu, for the resumable checks).
+//
+// With requireIdle, a resumable session that is merely detached and still
+// inside its grace period counts as busy: its client may be about to resume
+// it, and closing it now would turn a recoverable blip into a dropped
+// session.
 func (st *SessionStore) removeAndMarkClosed(s *Session, requireIdle bool) bool {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -113,7 +125,7 @@ func (st *SessionStore) removeAndMarkClosed(s *Session, requireIdle bool) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || (requireIdle && s.pollInFlight != 0) {
+	if s.closed || (requireIdle && (s.pollInFlight != 0 || s.inResumeGraceLocked(time.Now()))) {
 		return false
 	}
 	s.closed = true
@@ -124,19 +136,54 @@ func (st *SessionStore) removeAndMarkClosed(s *Session, requireIdle bool) bool {
 // sweep evicts every session that has gone quiet past timeout with no poll
 // parked on it. The final expiry and transport checks happen while holding both
 // lifecycle locks, so a poll cannot attach between checking and removal.
+//
+// A resumable session is judged differently: while it is still resumable
+// (its reliable layer is not broken), what matters is how long it has been
+// detached, measured against its own resumeGrace rather than timeout — a
+// resumable session that lost its transport is exactly the case the grace
+// exists for. Beyond that, maxDetachedResumable bounds how many such
+// sessions may wait at once; the longest-detached are evicted first.
 func (st *SessionStore) sweep(timeout time.Duration, onEvict func(*Session)) {
 	now := time.Now()
 	var expired []*Session
+	var detached []*Session
 
 	st.mu.Lock()
 	for id, s := range st.sessions {
 		s.mu.Lock()
-		if !s.closed && s.pollInFlight == 0 && now.Sub(s.lastActive) > timeout {
-			s.closed = true
-			delete(st.sessions, id)
-			expired = append(expired, s)
+		if !s.closed && s.pollInFlight == 0 {
+			switch {
+			case s.rs != nil && !s.rs.isBroken():
+				if now.Sub(s.detachedAt) > s.resumeGrace {
+					s.closed = true
+					delete(st.sessions, id)
+					expired = append(expired, s)
+				} else {
+					detached = append(detached, s)
+				}
+			case now.Sub(s.lastActive) > timeout:
+				s.closed = true
+				delete(st.sessions, id)
+				expired = append(expired, s)
+			}
 		}
 		s.mu.Unlock()
+	}
+	if max := st.maxDetachedResumable; max > 0 && len(detached) > max {
+		// detachedAt was read under s.mu above and only changes when a
+		// transport attaches or detaches, which needs s.mu; a stale value
+		// here just means a slightly unfair pick, never a wrong eviction —
+		// the recheck below is what decides.
+		sort.Slice(detached, func(i, j int) bool { return detached[i].detachedAt.Before(detached[j].detachedAt) })
+		for _, s := range detached[:len(detached)-max] {
+			s.mu.Lock()
+			if !s.closed && s.pollInFlight == 0 {
+				s.closed = true
+				delete(st.sessions, s.ID)
+				expired = append(expired, s)
+			}
+			s.mu.Unlock()
+		}
 	}
 	st.mu.Unlock()
 
