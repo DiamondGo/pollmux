@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -81,9 +82,10 @@ type resumableConn struct {
 
 	// ws is the current WebSocket connection when transport is
 	// TransportWebSocket. Only the supervisor replaces it, between one set
-	// of legs ending and the next starting, so the legs read it without a
-	// lock.
-	ws *websocket.Conn
+	// of legs ending and the next starting; Close reads it after waiting
+	// the supervisor out. Atomic anyway, so that safety does not hinge on
+	// a reader knowing that ordering.
+	ws atomic.Pointer[websocket.Conn]
 
 	transportFailed chan struct{}
 	failOnce        sync.Once
@@ -134,8 +136,8 @@ func (c *resumableConn) Close() error {
 	c.rl.interruptOut()
 	c.wg.Wait()
 	c.rl.in.Close()
-	if c.ws != nil {
-		c.ws.CloseNow()
+	if ws := c.ws.Load(); ws != nil {
+		ws.CloseNow()
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -234,8 +236,8 @@ func (c *resumableConn) runLegs() error {
 	defer cancel()
 
 	errCh := make(chan error, 2)
+	ws := c.ws.Load()
 	if c.transport == TransportWebSocket {
-		ws := c.ws
 		go func() { errCh <- c.wsReadLoop(legCtx, ws) }()
 		go func() { errCh <- c.wsWriteLoop(legCtx, ws) }()
 	} else {
@@ -248,8 +250,8 @@ func (c *resumableConn) runLegs() error {
 	// A sender parked in nextOut has no context to observe; this is what
 	// gets it back to check legCtx.
 	c.rl.interruptOut()
-	if c.transport == TransportWebSocket {
-		c.ws.CloseNow()
+	if ws != nil {
+		ws.CloseNow()
 	}
 	<-errCh
 	return err
@@ -257,10 +259,15 @@ func (c *resumableConn) runLegs() error {
 
 // resume performs the handshake with ResumeHandler and, for WebSocket
 // transport, dials the replacement connection, retrying transient failures
-// with backoff until the server's grace period is spent. A definitive
-// refusal (any 4xx, including the 409 for offsets the server cannot honour
-// and the 410/404 for a session that is gone) ends it at once — retrying
-// cannot change a server's mind about those.
+// with jittered backoff until the server's grace period is spent. A
+// definitive refusal (any 4xx, including the 409 for offsets the server
+// cannot honour and the 410/404 for a session that is gone) ends it at
+// once — retrying cannot change a server's mind about those.
+//
+// The jitter matters more here than for an ordinary reconnect: the failure
+// this exists for — a CDN closing every connection that reached its
+// maximum age — hits a whole fleet of clients within the same second, and
+// without it they would all retry on the same beat.
 func (c *resumableConn) resume() error {
 	deadline := time.Now().Add(c.resumeGrace)
 	backoff := 250 * time.Millisecond
@@ -278,7 +285,7 @@ func (c *resumableConn) resume() error {
 			}
 			ws, err := c.dialWS()
 			if err == nil {
-				c.ws = ws
+				c.ws.Store(ws)
 				return nil
 			}
 			// A dial failure right after a successful handshake: the next
@@ -296,12 +303,19 @@ func (c *resumableConn) resume() error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("pollmux: resume grace %v exhausted after %d attempts: %w", c.resumeGrace, attempt, lastErr)
 		}
-		c.logger.Debug("pollmux: resume attempt failed, retrying", "attempt", attempt, "error", lastErr, "retry_in", backoff)
-		if !sleepOrDone(c.ctx, backoff) {
+		wait := jitter(backoff)
+		c.logger.Debug("pollmux: resume attempt failed, retrying", "attempt", attempt, "error", lastErr, "retry_in", wait)
+		if !sleepOrDone(c.ctx, wait) {
 			return c.ctx.Err()
 		}
 		backoff = min(backoff*2, 2*time.Second)
 	}
+}
+
+// jitter spreads d by ±20%, so clients that lost their transport at the
+// same instant do not retry in lockstep.
+func jitter(d time.Duration) time.Duration {
+	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
 }
 
 // doResume performs one POST {prefix}/{id}/resume exchange.
@@ -694,7 +708,7 @@ func (c *Connector) connectResumable(ctx context.Context, base string, cr *Conne
 			cancel()
 			return nil, err
 		}
-		conn.ws = ws
+		conn.ws.Store(ws)
 	} else {
 		conn.transport = PollModeStream
 		conn.pollClient = &http.Client{Transport: c.newTransport(dialTimeout, pollGrace), CheckRedirect: noRedirect}

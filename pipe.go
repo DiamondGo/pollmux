@@ -146,7 +146,12 @@ func (p *BufferedPipe) Read(dst []byte) (int, error) {
 // answering 204 there would leave the client polling an empty session until its
 // own timeout instead of reconnecting (A5). Returns (0, errPipeInterrupted)
 // if interrupt was called; only the resumable transport ever does that, so
-// every other caller keeps seeing exactly the three outcomes above.
+// every other caller keeps seeing exactly the three outcomes above. An
+// interrupted return says nothing about the pipe's contents — data may
+// well be buffered (an interrupt that lands during the coalesce window is
+// reported on the *following* call, after that call's data has been
+// returned) — so a caller must treat it purely as "re-check your state and
+// call again", never as "the pipe is empty".
 func (p *BufferedPipe) ReadAvailable(dst []byte, timeout time.Duration, coalesceWindow time.Duration) (int, error) {
 	if coalesceWindow <= 0 {
 		coalesceWindow = DefaultCoalesceWindow
