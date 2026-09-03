@@ -711,7 +711,7 @@ func TestServerConfigDefaultsAreCoherent(t *testing.T) {
 	if cfg.PollBufferSize != DefaultPollBufferSize {
 		t.Fatalf("default PollBufferSize = %d, want %d", cfg.PollBufferSize, DefaultPollBufferSize)
 	}
-	l := cfg.limits("")
+	l := cfg.limits("", false)
 	if l.PollTimeoutMS != DefaultPollTimeout.Milliseconds() {
 		t.Fatalf("limits poll_timeout_ms = %d, want %d", l.PollTimeoutMS, DefaultPollTimeout.Milliseconds())
 	}

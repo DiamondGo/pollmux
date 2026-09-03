@@ -24,7 +24,22 @@ const (
 	// the client must treat this the same as batch mode's 410 — surface
 	// TransportFailed and let the caller reconnect with a fresh session.
 	frameGone frameType = 0x04
+	// frameAck and frameSeqData only ever appear on a session that
+	// negotiated ConnectResponse.Resumable (see reliable.go). frameAck's
+	// payload is one 8-byte big-endian cumulative offset: "I have every
+	// byte below this". frameSeqData replaces frameData on such a session:
+	// its payload is an 8-byte big-endian offset of the first data byte,
+	// followed by the data. Carrying the absolute offset on every data frame
+	// is what lets a receiver drop a replayed byte it already has and refuse
+	// a stream with a hole in it, instead of handing yamux a corrupted byte
+	// stream — see reliable.recvIn.
+	frameAck     frameType = 0x05
+	frameSeqData frameType = 0x06
 )
+
+// seqHeaderLen is the size of the offset that prefixes a frameSeqData payload
+// and that forms the whole of a frameAck payload.
+const seqHeaderLen = 8
 
 // frameHeaderLen is 1 byte type + 4 byte big-endian length. Only frameData
 // gives the length field meaning; frameHeartbeat, frameEnd, and frameGone
@@ -45,6 +60,47 @@ func writeFrame(w io.Writer, typ frameType, payload []byte) error {
 	}
 	_, err := w.Write(payload)
 	return err
+}
+
+// writeSeqFrame writes one frameSeqData frame carrying payload at offset off,
+// as three writes with no intermediate copy — a resumable session's data
+// frames are the hot path, and payload can be a full PollBufferBytes.
+func writeSeqFrame(w io.Writer, off uint64, payload []byte) error {
+	var hdr [frameHeaderLen + seqHeaderLen]byte
+	hdr[0] = byte(frameSeqData)
+	binary.BigEndian.PutUint32(hdr[1:], uint32(seqHeaderLen+len(payload)))
+	binary.BigEndian.PutUint64(hdr[frameHeaderLen:], off)
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	if len(payload) == 0 {
+		return nil
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+// encodeOffset renders a frameAck payload (or a frameSeqData prefix).
+func encodeOffset(n uint64) []byte {
+	var b [seqHeaderLen]byte
+	binary.BigEndian.PutUint64(b[:], n)
+	return b[:]
+}
+
+// decodeAck parses a frameAck payload.
+func decodeAck(payload []byte) (uint64, error) {
+	if len(payload) != seqHeaderLen {
+		return 0, fmt.Errorf("pollmux: ack frame payload is %d bytes, want %d", len(payload), seqHeaderLen)
+	}
+	return binary.BigEndian.Uint64(payload), nil
+}
+
+// splitSeq separates a frameSeqData payload into its offset and data.
+func splitSeq(payload []byte) (uint64, []byte, error) {
+	if len(payload) < seqHeaderLen {
+		return 0, nil, fmt.Errorf("pollmux: seq-data frame payload is %d bytes, shorter than its %d-byte offset", len(payload), seqHeaderLen)
+	}
+	return binary.BigEndian.Uint64(payload), payload[seqHeaderLen:], nil
 }
 
 // frameReader decodes stream frames, returning exactly one frame per call to
@@ -79,11 +135,21 @@ func (f *frameReader) next() (frameType, []byte, error) {
 	}
 	typ := frameType(f.hdr[0])
 	length := binary.BigEndian.Uint32(f.hdr[1:])
-	if typ != frameData || length == 0 {
+	if length == 0 {
 		return typ, nil, nil
 	}
-	if int64(length) > int64(f.maxPayload) {
-		return 0, nil, fmt.Errorf("pollmux: stream frame length %d exceeds max %d", length, f.maxPayload)
+	// A frameSeqData payload is the data plus its offset prefix, so it may
+	// legitimately run seqHeaderLen past the negotiated data bound; a
+	// frameAck payload is exactly one offset, whatever the data bound is.
+	maxPayload := f.maxPayload
+	switch typ {
+	case frameSeqData:
+		maxPayload += seqHeaderLen
+	case frameAck:
+		maxPayload = seqHeaderLen
+	}
+	if int64(length) > int64(maxPayload) {
+		return 0, nil, fmt.Errorf("pollmux: stream frame length %d exceeds max %d", length, maxPayload)
 	}
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(f.r, payload); err != nil {

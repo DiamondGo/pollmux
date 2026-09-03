@@ -57,6 +57,13 @@ func newMiniBroker(t *testing.T, token string, tls bool) *miniBroker {
 // newMiniBrokerWithMode is newMiniBroker's poll-mode-aware counterpart, used
 // by the two topology tests parameterized over batch/stream.
 func newMiniBrokerWithMode(t *testing.T, token string, tls bool, mode string) *miniBroker {
+	return newMiniBrokerOpts(t, token, tls, mode, false)
+}
+
+// newMiniBrokerOpts additionally lets the broker offer resumable sessions
+// (ServerConfig.EnableResume plus ResumeHandler mounted), the shape
+// HttpBroker takes once it turns the feature on.
+func newMiniBrokerOpts(t *testing.T, token string, tls bool, mode string, resume bool) *miniBroker {
 	t.Helper()
 
 	b := &miniBroker{
@@ -86,6 +93,10 @@ func newMiniBrokerWithMode(t *testing.T, token string, tls bool, mode string) *m
 	if mode == PollModeStream {
 		b.cfg.HeartbeatInterval = 100 * time.Millisecond
 		b.cfg.StreamMaxDuration = 400 * time.Millisecond
+	}
+	if resume {
+		b.cfg.EnableResume = true
+		b.cfg.ResumeGrace = 3 * time.Second
 	}
 
 	b.hooks = Hooks{
@@ -120,6 +131,9 @@ func newMiniBrokerWithMode(t *testing.T, token string, tls bool, mode string) *m
 	mux.Handle("/tunnel/connect", wrap(ConnectHandler(b.store, b.cfg, b.hooks)))
 	mux.Handle("/tunnel/{id}/poll", wrap(PollHandler(b.store, b.cfg, b.hooks)))
 	mux.Handle("/tunnel/{id}", wrap(DeleteHandler(b.store, b.cfg, b.hooks)))
+	if resume {
+		mux.Handle("/tunnel/{id}/resume", wrap(ResumeHandler(b.store, b.cfg, b.hooks)))
+	}
 
 	if tls {
 		b.ts = httptest.NewTLSServer(mux)
@@ -323,6 +337,14 @@ func runMiniProvider(t *testing.T, ctx context.Context, brokerURL, token, endpoi
 
 // runMiniProviderMode is runMiniProvider's poll-mode-aware counterpart.
 func runMiniProviderMode(t *testing.T, ctx context.Context, brokerURL, token, endpoint string, insecure, preferStream bool) *miniProvider {
+	return runMiniProviderOpts(t, ctx, brokerURL, token, endpoint, insecure, preferStream, false)
+}
+
+// runMiniProviderOpts additionally lets the provider ask for a resumable
+// session. Upload streaming is forced on (no probe) so the session actually
+// qualifies for resume; a real deployment that needs the probe gets the
+// same result one connect later (see Connector.PreferResume).
+func runMiniProviderOpts(t *testing.T, ctx context.Context, brokerURL, token, endpoint string, insecure, preferStream, preferResume bool) *miniProvider {
 	t.Helper()
 	p := &miniProvider{
 		outcomes: make(chan Outcome, 8),
@@ -338,6 +360,11 @@ func runMiniProviderMode(t *testing.T, ctx context.Context, brokerURL, token, en
 				PollGrace:          2 * time.Second,
 				InsecureSkipVerify: insecure,
 				PreferStream:       preferStream,
+				PreferResume:       preferResume,
+			}
+			if preferResume {
+				c.UploadStreamPreference = PollModeStream
+				c.PollGrace = 500 * time.Millisecond
 			}
 			return c.Connect(ctx)
 		},
@@ -404,6 +431,11 @@ func runMiniConsumer(t *testing.T, ctx context.Context, brokerURL, token, endpoi
 
 // runMiniConsumerMode is runMiniConsumer's poll-mode-aware counterpart.
 func runMiniConsumerMode(t *testing.T, ctx context.Context, brokerURL, token, endpoint string, insecure, preferStream bool) *miniConsumer {
+	return runMiniConsumerOpts(t, ctx, brokerURL, token, endpoint, insecure, preferStream, false)
+}
+
+// runMiniConsumerOpts is runMiniProviderOpts' consumer counterpart.
+func runMiniConsumerOpts(t *testing.T, ctx context.Context, brokerURL, token, endpoint string, insecure, preferStream, preferResume bool) *miniConsumer {
 	t.Helper()
 	c := &miniConsumer{
 		outcomes: make(chan Outcome, 8),
@@ -420,6 +452,11 @@ func runMiniConsumerMode(t *testing.T, ctx context.Context, brokerURL, token, en
 				PollGrace:          2 * time.Second,
 				InsecureSkipVerify: insecure,
 				PreferStream:       preferStream,
+				PreferResume:       preferResume,
+			}
+			if preferResume {
+				conn.UploadStreamPreference = PollModeStream
+				conn.PollGrace = 500 * time.Millisecond
 			}
 			return conn.Connect(ctx)
 		},

@@ -62,6 +62,20 @@ const (
 	// of it leaves no margin), not just under SessionTimeout.
 	DefaultStreamMaxDuration = 45 * time.Second
 
+	// DefaultResumeGrace is how long a resumable session survives on the
+	// server with no transport attached, waiting for the client to resume it
+	// (see ServerConfig.ResumeGrace). It only needs to cover one reconnect —
+	// the client's detection time plus a few retries — not a long outage.
+	DefaultResumeGrace = 30 * time.Second
+	// MaxResumeGrace caps ServerConfig.ResumeGrace: a detached resumable
+	// session holds its replay buffer for the whole grace period, so an
+	// unbounded grace would be an unbounded memory hold.
+	MaxResumeGrace = 5 * time.Minute
+	// DefaultMaxDetachedResumable caps how many resumable sessions may sit
+	// detached (waiting to be resumed) at once; beyond it the sweeper evicts
+	// the longest-detached first. See ServerConfig.MaxDetachedResumable.
+	DefaultMaxDetachedResumable = 1024
+
 	// defaultStreamReadGrace is the server's local safety margin for the
 	// upload-stream read-idle watchdog (PollHandler's pollSendStream): if no
 	// frame — data or heartbeat — arrives within HeartbeatInterval plus this
@@ -81,6 +95,14 @@ const (
 	DefaultSendTimeout  = 15 * time.Second
 	DefaultDialTimeout  = 10 * time.Second
 	DefaultMaxSendChunk = 512 << 10
+
+	// DefaultMaxReplayBytes bounds each direction's replay buffer on a
+	// resumable connection (see Connector.MaxReplayBytes). yamux's flow
+	// control already keeps the buffer near MaxStreamWindowSize per active
+	// stream while the transport is down, so this is a hard ceiling for the
+	// pathological case — very many streams, or a peer that never
+	// acknowledges — not a number a healthy session should ever approach.
+	DefaultMaxReplayBytes = 16 << 20
 
 	// DefaultUploadProbeTimeout bounds Connector's connect-time auto-detect
 	// probe for upload streaming (see Connector.UploadStreamPreference).
@@ -111,10 +133,10 @@ const DefaultCoalesceWindow = 2 * time.Millisecond
 
 // Reconnect defaults. See ReconnectLoop.
 const (
-	DefaultInitialBackoff     = 1 * time.Second
-	DefaultMaxBackoff         = 3 * time.Minute
-	DefaultPeerClosedPause    = 500 * time.Millisecond
-	DefaultMinStableDuration  = 5 * time.Second
+	DefaultInitialBackoff    = 1 * time.Second
+	DefaultMaxBackoff        = 3 * time.Minute
+	DefaultPeerClosedPause   = 500 * time.Millisecond
+	DefaultMinStableDuration = 5 * time.Second
 )
 
 // ConnectRequest is the JSON body of POST {prefix}/connect.
@@ -145,6 +167,29 @@ type ConnectRequest struct {
 	// ConnectResponse.Transport and the client falls back to whatever
 	// PreferStreamMode/PreferStreamUpload negotiated, unchanged.
 	PreferWebSocket bool `json:"prefer_websocket,omitempty"`
+	// PreferResume asks the server to make this session resumable across
+	// transport failures (see ConnectResponse.Resumable and reliable.go).
+	// Gated by ServerConfig.EnableResume and by the negotiated transport:
+	// only WebSocket, or stream mode in both directions, can be resumed. An
+	// old server ignores the field and the client works exactly as before.
+	PreferResume bool `json:"prefer_resume,omitempty"`
+}
+
+// ResumeRequest is the JSON body of POST {prefix}/{id}/resume, sent by a
+// resumable client after its transport failed (see ResumeHandler).
+type ResumeRequest struct {
+	ProtocolVersion int `json:"protocol_version"`
+	// RecvOffset is the count of downstream bytes the client has received
+	// contiguously. The server replays everything from here on.
+	RecvOffset uint64 `json:"recv_offset"`
+}
+
+// ResumeResponse is the JSON body of a successful resume.
+type ResumeResponse struct {
+	Resumed bool `json:"resumed"`
+	// RecvOffset is the count of upstream bytes the server has received
+	// contiguously. The client replays everything from here on.
+	RecvOffset uint64 `json:"recv_offset"`
 }
 
 // Limits are the transport parameters the server hands down at connect time.
@@ -166,6 +211,11 @@ type Limits struct {
 	// in a batch-mode response, same as today.
 	HeartbeatIntervalMS int64 `json:"heartbeat_interval_ms,omitempty"`
 	StreamMaxDurationMS int64 `json:"stream_max_duration_ms,omitempty"`
+	// ResumeGraceMS is only set when this connect negotiated a resumable
+	// session (see ConnectResponse.Resumable): how long the server keeps a
+	// detached session waiting to be resumed. The client stops retrying
+	// resume after this long and falls back to a fresh session.
+	ResumeGraceMS int64 `json:"resume_grace_ms,omitempty"`
 }
 
 // PollTimeout returns PollTimeoutMS as a duration.
@@ -186,6 +236,11 @@ func (l Limits) HeartbeatInterval() time.Duration {
 // StreamMaxDuration returns StreamMaxDurationMS as a duration.
 func (l Limits) StreamMaxDuration() time.Duration {
 	return time.Duration(l.StreamMaxDurationMS) * time.Millisecond
+}
+
+// ResumeGrace returns ResumeGraceMS as a duration.
+func (l Limits) ResumeGrace() time.Duration {
+	return time.Duration(l.ResumeGraceMS) * time.Millisecond
 }
 
 // Validate rejects limits that cannot be honoured, so a client fails at connect
@@ -230,6 +285,12 @@ type ConnectResponse struct {
 	// UploadStreamMode as negotiated above", never as an error: this field is
 	// purely additive over the existing negotiation.
 	Transport string `json:"transport,omitempty"`
+	// Resumable is true when the server agreed to keep this session alive
+	// across transport failures (see ConnectRequest.PreferResume). The
+	// client then wraps the transport in the reliable layer (reliable.go)
+	// and reattaches through ResumeHandler instead of reconnecting. Empty
+	// from an older server; a client must treat that as false.
+	Resumable bool `json:"resumable,omitempty"`
 }
 
 // errorResponse is the JSON body of any non-2xx answer from the handlers.

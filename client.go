@@ -139,6 +139,23 @@ type Connector struct {
 	// WebSocket connection carries both directions, so there is no separate
 	// upload leg to probe.
 	PreferWebSocket bool
+	// PreferResume asks the server to make the session resumable: if the
+	// transport later fails, the Conn resumes the same session (see
+	// ResumeHandler) instead of surfacing TransportFailed, and the yamux
+	// session on top of it — with every stream in it — carries on. Only
+	// honoured for WebSocket transport or stream mode in both directions;
+	// ignored by a server with ServerConfig.EnableResume off, or an older
+	// server, with no visible difference to the caller. With
+	// UploadStreamPreference on auto, a failed upload probe means the
+	// connection falls back to a non-resumable one (it reconnects once,
+	// without asking for resume), since the probe's fallback — discrete
+	// uploads — cannot be resumed.
+	PreferResume bool
+	// MaxReplayBytes caps how much unacknowledged data each direction of a
+	// resumable connection retains for replay; beyond it the connection
+	// stops being resumable and its next transport failure ends it like a
+	// non-resumable one. Defaults to DefaultMaxReplayBytes.
+	MaxReplayBytes int
 	// Logger receives transport diagnostics. Nil disables logging.
 	Logger *slog.Logger
 
@@ -174,6 +191,13 @@ func (c *Connector) logger() *slog.Logger {
 
 // Connect registers with the server and returns a ready virtual connection.
 func (c *Connector) Connect(ctx context.Context) (Conn, error) {
+	return c.connect(ctx, c.PreferResume)
+}
+
+// connect is Connect with the resume preference as a parameter, so the one
+// case where a resumable connect has to be redone without resume (an upload
+// probe failing, see below) can recurse exactly once.
+func (c *Connector) connect(ctx context.Context, preferResume bool) (Conn, error) {
 	if c.BaseURL == "" {
 		return nil, errors.New("pollmux: Connector.BaseURL is required")
 	}
@@ -202,13 +226,28 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 		CheckRedirect: noRedirect,
 	}
 
-	cr, err := c.doConnect(ctx, connectClient, base)
+	cr, err := c.doConnect(ctx, connectClient, base, preferResume)
 	if err != nil {
 		return nil, err
 	}
 
 	if err := cr.Limits.Validate(); err != nil {
 		return nil, err
+	}
+
+	if cr.Resumable {
+		// The server only negotiates this for WebSocket or two-way stream
+		// mode; anything else is a server bug, and the grace is the client's
+		// retry budget, so both are checked the same way the stream-mode
+		// limits are below.
+		if cr.Limits.ResumeGraceMS <= 0 {
+			return nil, fmt.Errorf("pollmux: server negotiated a resumable session but sent non-positive resume_grace_ms=%d",
+				cr.Limits.ResumeGraceMS)
+		}
+		if cr.Transport != TransportWebSocket && (cr.PollMode != PollModeStream || cr.UploadStreamMode != PollModeStream) {
+			return nil, fmt.Errorf("pollmux: server negotiated a resumable session on transport=%q poll_mode=%q upload_stream_mode=%q, "+
+				"which cannot be resumed", cr.Transport, cr.PollMode, cr.UploadStreamMode)
+		}
 	}
 
 	// WebSocket is negotiated independently of, and takes priority over, the
@@ -221,6 +260,9 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 		if cr.Limits.HeartbeatIntervalMS <= 0 {
 			return nil, fmt.Errorf("pollmux: server negotiated websocket transport but sent non-positive heartbeat_interval_ms=%d",
 				cr.Limits.HeartbeatIntervalMS)
+		}
+		if cr.Resumable {
+			return c.connectResumable(ctx, base, cr, dialTimeout, sendTimeout, pollGrace, coalesce)
 		}
 		return c.connectWebSocket(ctx, base, cr, dialTimeout, pollGrace)
 	}
@@ -263,6 +305,30 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 	effectiveChunk := min(maxSendChunk, cr.Limits.MaxSendBytes)
 
 	logger := c.logger().With("session_id", cr.SessionID)
+
+	if cr.Resumable {
+		// Two-way stream mode, negotiated resumable. The reliable layer
+		// needs the upload leg to actually be a send-stream, so the auto
+		// probe runs first, exactly as it would for a plain stream
+		// connection; if the path fails it, this session is useless (its
+		// fallback, discrete uploads, cannot be resumed) — drop it and
+		// connect again without asking for resume.
+		if c.UploadStreamPreference == "" {
+			probeTimeout := orDuration(c.UploadProbeTimeout, DefaultUploadProbeTimeout)
+			probeClient := &http.Client{Transport: c.newTransport(dialTimeout, cr.Limits.StreamMaxDuration()+pollGrace), CheckRedirect: noRedirect}
+			ok := probeUploadStream(ctx, probeClient, fmt.Sprintf("%s/%s/poll", base, cr.SessionID), c.AuthToken, probeTimeout)
+			probeClient.CloseIdleConnections()
+			if !ok {
+				logger.Warn("pollmux: upload-stream probe did not pass within timeout; "+
+					"a resumable session needs streamed uploads, so reconnecting without resume — "+
+					"a proxy on this path likely buffers a long-lived request body instead of forwarding it live",
+					"probe_timeout", probeTimeout)
+				c.deleteSession(base, cr.SessionID, connectClient)
+				return c.connect(ctx, false)
+			}
+		}
+		return c.connectResumable(ctx, base, cr, dialTimeout, sendTimeout, pollGrace, coalesce)
+	}
 
 	// Two clients, deliberately not shared. The poll client must tolerate a
 	// response header withheld for the whole long-poll timeout; the send client
@@ -332,7 +398,7 @@ func (c *Connector) Connect(ctx context.Context) (Conn, error) {
 			conn.uploadStreamMode = false
 		default: // "" — auto-detect
 			probeTimeout := orDuration(c.UploadProbeTimeout, DefaultUploadProbeTimeout)
-			conn.uploadStreamMode = conn.probeUploadStream(probeTimeout)
+			conn.uploadStreamMode = probeUploadStream(conn.ctx, conn.sendStreamClient, conn.pollURL, conn.authToken, probeTimeout)
 			if !conn.uploadStreamMode {
 				logger.Warn("pollmux: upload-stream probe did not pass within timeout, "+
 					"falling back to batch uploads for this connection — "+
@@ -392,13 +458,14 @@ func (c *Connector) newTransport(dialTimeout, responseHeaderTimeout time.Duratio
 }
 
 // doConnect performs POST {prefix}/connect and parses the response.
-func (c *Connector) doConnect(ctx context.Context, client *http.Client, base string) (*ConnectResponse, error) {
+func (c *Connector) doConnect(ctx context.Context, client *http.Client, base string, preferResume bool) (*ConnectResponse, error) {
 	body, err := json.Marshal(ConnectRequest{
 		ProtocolVersion:    ProtocolVersion,
 		Meta:               c.Meta,
 		PreferStreamMode:   c.PreferStream,
 		PreferStreamUpload: c.UploadStreamPreference != PollModeBatch,
 		PreferWebSocket:    c.PreferWebSocket,
+		PreferResume:       preferResume,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pollmux: failed to encode connect request: %w", err)
@@ -454,6 +521,24 @@ func (c *Connector) doConnect(ctx context.Context, client *http.Client, base str
 			ErrProtocolVersion, ProtocolVersion, cr.ProtocolVersion)
 	}
 	return &cr, nil
+}
+
+// deleteSession sends a best-effort DELETE for a session Connect created but
+// decided not to use.
+func (c *Connector) deleteSession(base, id string, client *http.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, fmt.Sprintf("%s/%s", base, id), nil)
+	if err != nil {
+		return
+	}
+	if c.AuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.AuthToken)
+	}
+	if resp, err := client.Do(req); err == nil {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+	}
 }
 
 // httpConn is the Conn implementation: a poll loop pulling data down, and a
@@ -984,9 +1069,11 @@ func (c *httpConn) doSend(chunk []byte) error {
 // The probe never touches writePipe or the real session: the server
 // recognizes HeaderSendStreamProbe and discards the frames instead of
 // writing them upstream, so this is safe to run before any real data is
-// queued to send.
-func (c *httpConn) probeUploadStream(timeout time.Duration) bool {
-	ctx, cancel := context.WithTimeout(c.ctx, timeout)
+// queued to send. A package-level function rather than an httpConn method
+// because a resumable connect (see Connector.connect) runs it before it has
+// decided which Conn to build.
+func probeUploadStream(parent context.Context, client *http.Client, pollURL, authToken string, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	pr, pw := io.Pipe()
@@ -1009,7 +1096,7 @@ func (c *httpConn) probeUploadStream(timeout time.Duration) bool {
 		pw.Close()
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.pollURL, pr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, pollURL, pr)
 	if err != nil {
 		pw.CloseWithError(err)
 		return false
@@ -1018,9 +1105,11 @@ func (c *httpConn) probeUploadStream(timeout time.Duration) bool {
 	req.Header.Set(HeaderSendStream, "true")
 	req.Header.Set(HeaderSendStreamProbe, "true")
 	req.ContentLength = -1
-	c.setAuth(req)
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
 
-	resp, err := c.sendStreamClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		// Includes context.DeadlineExceeded — the expected outcome on a path
 		// that does not forward this request to the origin within timeout.

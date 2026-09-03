@@ -66,21 +66,82 @@ type Session struct {
 	// detection instead of a session_timeout wait (A3).
 	pollInFlight int32
 
+	// rs and att are only set for a session that negotiated
+	// ConnectResponse.Resumable, by ConnectHandler before the session is
+	// published, and never mutated after (same discipline as pollMode). rs
+	// is the byte layer that numbers, retains, and replays each direction
+	// (see reliable.go); att tracks which poll/WebSocket handler currently
+	// owns each direction so a replacement can kick a stale one off before
+	// taking over (see resume_server.go). resumeGrace is how long the
+	// session may sit with no transport attached before the sweeper gives
+	// up on it.
+	rs          *reliable
+	att         *attachments
+	resumeGrace time.Duration
+
 	mu         sync.Mutex
 	lastActive time.Time
 	closed     bool
+	// detachedAt is when pollInFlight last dropped to zero — the moment a
+	// resumable session's grace period starts. Only meaningful when rs is
+	// set; starts at creation so a session whose client never attaches at
+	// all is still bounded by the grace.
+	detachedAt time.Time
 }
 
 // newSession creates a session with initialized pipes. meta is copied, so later
 // mutation by the caller cannot affect the session.
 func newSession(id string, meta map[string]string) *Session {
+	now := time.Now()
 	return &Session{
 		ID:         id,
 		toServer:   NewBufferedPipe(),
 		toClient:   NewBufferedPipe(),
 		meta:       maps.Clone(meta),
-		lastActive: time.Now(),
+		lastActive: now,
+		detachedAt: now,
 	}
+}
+
+// enableResume arms the reliable layer on a freshly created session. Called
+// by ConnectHandler before the session is published, never after.
+func (s *Session) enableResume(maxReplay int, grace time.Duration) {
+	s.rs = newReliable(s.toClient, s.toServer, maxReplay)
+	s.att = newAttachments()
+	s.resumeGrace = grace
+}
+
+// Resumable reports whether this session negotiated resumable transport and
+// can still be resumed. It turns false for good once a direction's replay
+// buffer overflowed or the peer broke the protocol — from then on the
+// session behaves exactly like a non-resumable one.
+func (s *Session) Resumable() bool {
+	return s.rs != nil && !s.rs.isBroken()
+}
+
+// ResumeDeadline returns when a detached resumable session's grace period
+// runs out, and true, if the session is resumable and currently has no
+// transport attached. Otherwise it returns the zero time and false. A
+// reaper that closes sessions whose transport dropped (see
+// CloseSessionIfNoPollInFlight) can use this to leave a session alone
+// while its client may still come back.
+func (s *Session) ResumeDeadline() (time.Time, bool) {
+	if !s.Resumable() {
+		return time.Time{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pollInFlight != 0 || s.closed {
+		return time.Time{}, false
+	}
+	return s.detachedAt.Add(s.resumeGrace), true
+}
+
+// inResumeGraceLocked reports whether s is a detached resumable session
+// still inside its grace period. s.mu must be held.
+func (s *Session) inResumeGraceLocked(now time.Time) bool {
+	return s.rs != nil && s.pollInFlight == 0 && !s.rs.isBroken() &&
+		now.Sub(s.detachedAt) <= s.resumeGrace
 }
 
 // watchHighWater arms the high-water warning on both pipes.
@@ -154,7 +215,16 @@ func (s *Session) beginPoll() bool {
 func (s *Session) endPoll() {
 	s.mu.Lock()
 	s.pollInFlight--
+	s.noteDetachedLocked()
 	s.mu.Unlock()
+}
+
+// noteDetachedLocked stamps detachedAt when the last transport leaves a
+// resumable session. s.mu must be held.
+func (s *Session) noteDetachedLocked() {
+	if s.rs != nil && s.pollInFlight == 0 {
+		s.detachedAt = time.Now()
+	}
 }
 
 func (s *Session) beginWebSocket() bool {
@@ -172,6 +242,7 @@ func (s *Session) endWebSocket() {
 	s.mu.Lock()
 	s.wsAttached = false
 	s.pollInFlight--
+	s.noteDetachedLocked()
 	s.mu.Unlock()
 }
 
