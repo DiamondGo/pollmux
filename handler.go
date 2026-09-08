@@ -648,7 +648,11 @@ func pollStreamResumable(w http.ResponseWriter, r *http.Request, s *Session, cfg
 			if !s.att.isCurrent(att) {
 				return
 			}
+			// The current attachment was nudged, not failed. Keep the
+			// handled signal from being mistaken for an I/O error if this
+			// loop gains a shared error check in the future.
 			interrupted = true
+			err = nil
 		}
 
 		if ack, due := s.rs.takeAck(); due {

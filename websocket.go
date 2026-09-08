@@ -303,7 +303,11 @@ func wsWritePumpResumable(ctx context.Context, c *websocket.Conn, s *Session, cf
 			if !s.att.isCurrent(att) {
 				return errDetached
 			}
+			// A current attachment was only nudged to re-check state or
+			// carry an ack. Do not leak that internal signal as a WebSocket
+			// write failure when no ack is currently due.
 			interrupted = true
+			err = nil
 		}
 
 		wctx, cancel := context.WithTimeout(ctx, idle)

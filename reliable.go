@@ -222,6 +222,20 @@ func (r *reliable) recvOffsetNow() uint64 {
 	return r.recvOffset
 }
 
+type reliableProgress struct {
+	sent uint64
+	recv uint64
+}
+
+// progress snapshots the cumulative byte counts in both directions. The
+// supervisor uses it to distinguish a rapidly failing but productive series
+// of transports from a resume loop that never moves the session at all.
+func (r *reliable) progress() reliableProgress {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return reliableProgress{sent: r.sendOffset, recv: r.recvOffset}
+}
+
 // unacked is how many sent bytes the peer has not acknowledged — the replay
 // buffer's current size.
 func (r *reliable) unacked() int {
