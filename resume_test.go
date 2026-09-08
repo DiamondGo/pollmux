@@ -563,6 +563,92 @@ func TestResumeAfterDeleteFailsAndHookFiresOnce(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// client supervisor safety guard
+// ---------------------------------------------------------------------------
+
+func TestResumeStabilityGuardAbandonsConsecutiveFastLegs(t *testing.T) {
+	var g resumeStabilityGuard
+	for i := 1; i < maxConsecutiveFastResumes; i++ {
+		if g.record(resumableLegsMinStable-time.Nanosecond, false) {
+			t.Fatalf("guard abandoned after %d fast resumes, want %d", i, maxConsecutiveFastResumes)
+		}
+	}
+	if !g.record(resumableLegsMinStable-time.Nanosecond, false) {
+		t.Fatalf("guard did not abandon after %d consecutive fast resumes", maxConsecutiveFastResumes)
+	}
+}
+
+func TestResumeStabilityGuardStableOrProductiveLegResetsCounter(t *testing.T) {
+	var g resumeStabilityGuard
+	for i := 0; i < maxConsecutiveFastResumes-1; i++ {
+		if g.record(time.Millisecond, false) {
+			t.Fatal("guard abandoned before reaching the limit")
+		}
+	}
+	if g.record(resumableLegsMinStable, false) {
+		t.Fatal("a stable leg must reset, not trip, the guard")
+	}
+	if g.consecutiveFast != 0 {
+		t.Fatalf("consecutive fast count after stable leg = %d, want 0", g.consecutiveFast)
+	}
+
+	for i := 0; i < maxConsecutiveFastResumes-1; i++ {
+		if g.record(time.Millisecond, false) {
+			t.Fatalf("old fast failures leaked across reset at new failure %d", i+1)
+		}
+	}
+	if g.record(time.Millisecond, true) {
+		t.Fatal("a productive fast leg must reset, not trip, the guard")
+	}
+	if g.consecutiveFast != 0 {
+		t.Fatalf("consecutive fast count after productive leg = %d, want 0", g.consecutiveFast)
+	}
+}
+
+// A current resumable WebSocket attachment may be interrupted merely to
+// re-check its state. With no received bytes there is no ack to overwrite the
+// sentinel error; this is the exact path that used to leak errPipeInterrupted
+// out of wsWritePumpResumable and close an otherwise healthy connection.
+func TestWebSocketServerInterruptWithoutAckKeepsCurrentAttachment(t *testing.T) {
+	cfg := testResumeServerConfig()
+	ts, st := newResumeTestServer(t, cfg, Hooks{})
+	resp, cr := postConnect(t, ts, ConnectRequest{
+		ProtocolVersion: ProtocolVersion,
+		PreferWebSocket: true,
+		PreferResume:    true,
+	})
+	if resp.StatusCode != http.StatusOK || !cr.Resumable {
+		t.Fatalf("connect = %d resumable=%v, want a resumable WebSocket", resp.StatusCode, cr.Resumable)
+	}
+	s, _ := st.Get(cr.SessionID)
+	ws := dialWS(t, ts, cr.SessionID)
+
+	// Read one heartbeat so the handler is attached and its write pump has
+	// entered the normal pipe wait with recvOffset still zero.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, msg, err := ws.Read(ctx)
+	cancel()
+	if err != nil {
+		t.Fatalf("initial heartbeat: %v", err)
+	}
+	if typ, _, err := wsDecode(msg); err != nil || typ != frameHeartbeat {
+		t.Fatalf("initial frame = (%v, %v), want heartbeat", typ, err)
+	}
+
+	s.rs.interruptOut()
+
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	_, msg, err = ws.Read(ctx)
+	cancel()
+	if err != nil {
+		t.Fatalf("WebSocket closed after a harmless interrupt: %v", err)
+	}
+	if typ, _, err := wsDecode(msg); err != nil || typ != frameHeartbeat {
+		t.Fatalf("frame after interrupt = (%v, %v), want heartbeat", typ, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // end to end, through a proxy that breaks
 // ---------------------------------------------------------------------------
 
@@ -804,6 +890,124 @@ func isClosed(ch <-chan struct{}) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// A level-triggered interrupt can remain pending while no ack is due. It is a
+// wake-up, not a failed leg: the client write pump must keep running. Drive the
+// pump directly so a heartbeat observed by the peer is an explicit readiness
+// signal; because interrupts are level-triggered, injecting one after that
+// point guarantees the current or next nextOut wait consumes it.
+func TestWebSocketClientInterruptWithoutAckDoesNotStopWriteLoop(t *testing.T) {
+	serverWS := make(chan *websocket.Conn, 1)
+	handlerDone := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		serverWS <- ws
+		<-handlerDone
+		ws.CloseNow()
+	}))
+	t.Cleanup(func() {
+		close(handlerDone)
+		ts.Close()
+	})
+
+	clientWS, _, err := websocket.Dial(context.Background(), ts.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { clientWS.CloseNow() })
+	peerWS := <-serverWS
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rc := &resumableConn{
+		rl:             newReliable(NewBufferedPipe(), NewBufferedPipe(), DefaultMaxReplayBytes),
+		heartbeat:      20 * time.Millisecond,
+		idleTimeout:    time.Second,
+		coalesceWindow: time.Millisecond,
+		maxFrame:       4 << 10,
+	}
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- rc.wsWriteLoop(ctx, clientWS) }()
+	t.Cleanup(func() {
+		cancel()
+		rc.rl.interruptOut()
+		<-loopDone
+	})
+
+	readHeartbeat := func(stage string) {
+		t.Helper()
+		rctx, cancelRead := context.WithTimeout(context.Background(), 2*time.Second)
+		typ, msg, err := peerWS.Read(rctx)
+		cancelRead()
+		if err != nil {
+			t.Fatalf("%s heartbeat: %v", stage, err)
+		}
+		if typ != websocket.MessageBinary {
+			t.Fatalf("%s message type = %v, want binary", stage, typ)
+		}
+		ft, payload, err := wsDecode(msg)
+		if err != nil || ft != frameHeartbeat || len(payload) != 0 {
+			t.Fatalf("%s frame = (%v, %q, %v), want empty heartbeat", stage, ft, payload, err)
+		}
+	}
+
+	readHeartbeat("ready")
+	rc.rl.interruptOut()
+	readHeartbeat("after interrupt")
+}
+
+// Even if an unknown transport defect survives the targeted interrupt fix,
+// successful handshakes followed by immediately dead replacement legs must be
+// bounded. This proxy middleware accepts and instantly closes every WebSocket
+// dial after the first resume, while allowing /resume itself to keep returning
+// 200, reproducing the shape of the production spin.
+func TestSuperviseAbandonsConsecutiveFastSuccessfulResumes(t *testing.T) {
+	var poisonWebSockets atomic.Bool
+	middleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/resume") {
+				poisonWebSockets.Store(true)
+				next.ServeHTTP(w, r)
+				return
+			}
+			if poisonWebSockets.Load() && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/ws") {
+				ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+				if err == nil {
+					ws.CloseNow()
+				}
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+
+	e := newResumeE2E(t, TransportWebSocket, nil, middleware)
+	conn, err := e.connector(nil).Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	waitFor(t, 2*time.Second, func() bool { return e.proxy.connCount() >= 2 })
+	e.proxy.killAll()
+
+	select {
+	case <-conn.TransportFailed():
+	case <-time.After(10 * time.Second):
+		t.Fatal("supervisor kept resuming immediately dead legs instead of abandoning the session")
+	}
+
+	got := int(e.resumes.Load())
+	// The initial leg is normally fast and contributes to the limit. If a
+	// slow test machine kept it alive past the stable threshold, one extra
+	// successful resume is needed before five poisoned legs accumulate.
+	if got < maxConsecutiveFastResumes || got > maxConsecutiveFastResumes+1 {
+		t.Fatalf("resume handshakes before abandonment = %d, want %d or %d",
+			got, maxConsecutiveFastResumes, maxConsecutiveFastResumes+1)
 	}
 }
 

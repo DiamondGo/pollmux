@@ -184,6 +184,34 @@ func (c *resumableConn) onSessionClosed() {
 	c.fail()
 }
 
+const (
+	// resumableLegsMinStable is long enough to distinguish a transport that
+	// never became usable after resume from an ordinary established leg that
+	// later failed. A stable leg resets the consecutive-fast-failure guard.
+	resumableLegsMinStable = 2 * time.Second
+	// maxConsecutiveFastResumes bounds the otherwise unthrottled case where
+	// every resume handshake succeeds but its replacement legs fail at once.
+	maxConsecutiveFastResumes = 5
+)
+
+type resumeStabilityGuard struct {
+	consecutiveFast int
+}
+
+// record reports whether the session should be abandoned after a successful
+// resume. A leg that moved bytes is useful even if it was short-lived (for
+// example, tests and real flaky links can fail repeatedly during a bulk
+// transfer), so either duration or progress resets the guard. The inputs make
+// its boundary and reset behaviour testable without sleeping.
+func (g *resumeStabilityGuard) record(legsDuration time.Duration, progressed bool) bool {
+	if legsDuration >= resumableLegsMinStable || progressed {
+		g.consecutiveFast = 0
+		return false
+	}
+	g.consecutiveFast++
+	return g.consecutiveFast >= maxConsecutiveFastResumes
+}
+
 // supervise runs one set of legs after another until the connection is
 // closed or the session cannot be kept. Between sets it decides, from why
 // the previous set ended, whether resuming is even worth attempting: a
@@ -194,8 +222,12 @@ func (c *resumableConn) onSessionClosed() {
 // what resume is for.
 func (c *resumableConn) supervise() {
 	defer c.wg.Done()
+	var stability resumeStabilityGuard
 	for {
+		legsStart := time.Now()
+		progressBefore := c.rl.progress()
 		err := c.runLegs()
+		legsDuration := time.Since(legsStart)
 		if c.ctx.Err() != nil || c.closed.Load() {
 			return
 		}
@@ -219,6 +251,18 @@ func (c *resumableConn) supervise() {
 				return
 			}
 			c.logger.Warn("pollmux: could not resume the session, falling back to a fresh one", "error", err)
+			c.fail()
+			return
+		}
+		// Include peer progress learned by resumeOut from the handshake, not
+		// merely in-band acks observed before runLegs returned.
+		progressed := c.rl.progress() != progressBefore
+		if stability.record(legsDuration, progressed) {
+			c.logger.Warn("pollmux: replacement legs failed too quickly after consecutive resumes, abandoning session",
+				"consecutive_fast_resumes", stability.consecutiveFast,
+				"last_legs_duration", legsDuration,
+				"error", err,
+			)
 			c.fail()
 			return
 		}
@@ -530,7 +574,10 @@ func (c *resumableConn) feedSendStream(ctx context.Context, pw *io.PipeWriter) e
 				pw.CloseWithError(ctx.Err())
 				return ctx.Err()
 			}
+			// This is a wake-up signal, not a transport error. Clear it so
+			// later code cannot accidentally propagate it as a leg failure.
 			interrupted = true
+			err = nil
 		}
 
 		if ack, due := c.rl.takeAck(); due {
@@ -638,7 +685,11 @@ func (c *resumableConn) wsWriteLoop(ctx context.Context, ws *websocket.Conn) err
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			// The interrupt only asks this leg to re-check cancellation and
+			// send a pending ack. Leaving it in err makes the final err check
+			// below tear down a healthy WebSocket when no ack is due.
 			interrupted = true
+			err = nil
 		}
 
 		wctx, cancel := context.WithTimeout(ctx, c.idleTimeout)
