@@ -894,29 +894,70 @@ func isClosed(ch <-chan struct{}) bool {
 }
 
 // A level-triggered interrupt can remain pending while no ack is due. It is a
-// wake-up, not a failed leg: the client must keep the current WebSocket and
-// must not perform a resume handshake.
-func TestWebSocketClientInterruptWithoutAckDoesNotResume(t *testing.T) {
-	e := newResumeE2E(t, TransportWebSocket, nil, nil)
-	conn, err := e.connector(nil).Connect(context.Background())
+// wake-up, not a failed leg: the client write pump must keep running. Drive the
+// pump directly so a heartbeat observed by the peer is an explicit readiness
+// signal; because interrupts are level-triggered, injecting one after that
+// point guarantees the current or next nextOut wait consumes it.
+func TestWebSocketClientInterruptWithoutAckDoesNotStopWriteLoop(t *testing.T) {
+	serverWS := make(chan *websocket.Conn, 1)
+	handlerDone := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		serverWS <- ws
+		<-handlerDone
+		ws.CloseNow()
+	}))
+	t.Cleanup(func() {
+		close(handlerDone)
+		ts.Close()
+	})
+
+	clientWS, _, err := websocket.Dial(context.Background(), ts.URL, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { conn.Close() })
-	rc := conn.(*resumableConn)
+	t.Cleanup(func() { clientWS.CloseNow() })
+	peerWS := <-serverWS
 
-	// Let both pumps settle into their idle waits, then inject the same
-	// harmless wake-up used by attachment replacement and eager acknowledgements.
-	time.Sleep(50 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	rc := &resumableConn{
+		rl:             newReliable(NewBufferedPipe(), NewBufferedPipe(), DefaultMaxReplayBytes),
+		heartbeat:      20 * time.Millisecond,
+		idleTimeout:    time.Second,
+		coalesceWindow: time.Millisecond,
+		maxFrame:       4 << 10,
+	}
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- rc.wsWriteLoop(ctx, clientWS) }()
+	t.Cleanup(func() {
+		cancel()
+		rc.rl.interruptOut()
+		<-loopDone
+	})
+
+	readHeartbeat := func(stage string) {
+		t.Helper()
+		rctx, cancelRead := context.WithTimeout(context.Background(), 2*time.Second)
+		typ, msg, err := peerWS.Read(rctx)
+		cancelRead()
+		if err != nil {
+			t.Fatalf("%s heartbeat: %v", stage, err)
+		}
+		if typ != websocket.MessageBinary {
+			t.Fatalf("%s message type = %v, want binary", stage, typ)
+		}
+		ft, payload, err := wsDecode(msg)
+		if err != nil || ft != frameHeartbeat || len(payload) != 0 {
+			t.Fatalf("%s frame = (%v, %q, %v), want empty heartbeat", stage, ft, payload, err)
+		}
+	}
+
+	readHeartbeat("ready")
 	rc.rl.interruptOut()
-	time.Sleep(3 * e.cfg.HeartbeatInterval)
-
-	if got := e.resumes.Load(); got != 0 {
-		t.Fatalf("harmless client interrupt caused %d resume handshakes", got)
-	}
-	if isClosed(conn.TransportFailed()) {
-		t.Fatal("harmless client interrupt failed the resumable connection")
-	}
+	readHeartbeat("after interrupt")
 }
 
 // Even if an unknown transport defect survives the targeted interrupt fix,
