@@ -228,7 +228,6 @@ func (c *resumableConn) supervise() {
 		progressBefore := c.rl.progress()
 		err := c.runLegs()
 		legsDuration := time.Since(legsStart)
-		progressed := c.rl.progress() != progressBefore
 		if c.ctx.Err() != nil || c.closed.Load() {
 			return
 		}
@@ -255,6 +254,9 @@ func (c *resumableConn) supervise() {
 			c.fail()
 			return
 		}
+		// Include peer progress learned by resumeOut from the handshake, not
+		// merely in-band acks observed before runLegs returned.
+		progressed := c.rl.progress() != progressBefore
 		if stability.record(legsDuration, progressed) {
 			c.logger.Warn("pollmux: replacement legs failed too quickly after consecutive resumes, abandoning session",
 				"consecutive_fast_resumes", stability.consecutiveFast,

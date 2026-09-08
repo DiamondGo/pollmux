@@ -223,17 +223,20 @@ func (r *reliable) recvOffsetNow() uint64 {
 }
 
 type reliableProgress struct {
-	sent uint64
-	recv uint64
+	acked uint64
+	recv  uint64
 }
 
-// progress snapshots the cumulative byte counts in both directions. The
-// supervisor uses it to distinguish a rapidly failing but productive series
-// of transports from a resume loop that never moves the session at all.
+// progress snapshots bytes the peer has confirmed receiving from us and bytes
+// we have received from it. sendOffset is deliberately excluded: nextOut
+// advances it before the transport write, so it proves only that local input
+// was consumed, not that a failing leg moved anything across the network.
+// ackedOffset includes both in-band acks and the peer's recv offset accepted by
+// resumeOut, making both fields evidence of peer-visible progress.
 func (r *reliable) progress() reliableProgress {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return reliableProgress{sent: r.sendOffset, recv: r.recvOffset}
+	return reliableProgress{acked: r.ackedOffset, recv: r.recvOffset}
 }
 
 // unacked is how many sent bytes the peer has not acknowledged — the replay

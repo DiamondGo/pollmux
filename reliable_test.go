@@ -90,6 +90,50 @@ func TestReliableNumbersRetainsAndReplays(t *testing.T) {
 	}
 }
 
+func TestReliableProgressOnlyCountsPeerVisibleBytes(t *testing.T) {
+	r := newTestReliable(1 << 20)
+	initial := r.progress()
+
+	// Pulling local input assigns offsets before the caller attempts its
+	// transport write. It must not count as progress: that write may fail
+	// without a single byte reaching the peer.
+	r.out.Write([]byte("abc"))
+	mustNext(t, r, 64)
+	if got := r.progress(); got != initial {
+		t.Fatalf("progress changed after nextOut only: got %+v, want %+v", got, initial)
+	}
+
+	if err := r.ack(3); err != nil {
+		t.Fatal(err)
+	}
+	afterAck := r.progress()
+	if afterAck == initial || afterAck.acked != 3 {
+		t.Fatalf("progress after peer ack = %+v, want acked=3", afterAck)
+	}
+
+	// A resume handshake's peer recv offset is equally authoritative even
+	// when the in-band ack was lost with the old transport.
+	r.out.Write([]byte("def"))
+	mustNext(t, r, 64)
+	beforeResume := r.progress()
+	if !r.resumeOut(6) {
+		t.Fatal("resumeOut refused the peer's received offset")
+	}
+	afterResume := r.progress()
+	if afterResume == beforeResume || afterResume.acked != 6 {
+		t.Fatalf("progress after resume offset = %+v, want acked=6", afterResume)
+	}
+
+	beforeRecv := r.progress()
+	if err := r.recvIn(0, []byte("down")); err != nil {
+		t.Fatal(err)
+	}
+	afterRecv := r.progress()
+	if afterRecv == beforeRecv || afterRecv.recv != 4 {
+		t.Fatalf("progress after received bytes = %+v, want recv=4", afterRecv)
+	}
+}
+
 func TestReliableRecvDedupsReplayAndRefusesGaps(t *testing.T) {
 	r := newTestReliable(1 << 20)
 
