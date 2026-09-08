@@ -84,11 +84,24 @@ func WebSocketHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler 
 		// is already clear for the newcomer. The kick closes the
 		// connection (failing whichever pump is inside Read/Write) and
 		// interrupts the write pump's pipe wait.
+		// Not r.Context(): coder/websocket's Accept doc warns that using the
+		// request context after Accept returns may lead to unexpected behavior.
+		// A handler-owned context instead gives attachment replacement an
+		// explicit way to stop both pumps without depending on socket I/O to
+		// notice CloseNow. It must exist before attach because kick can run as
+		// soon as this attachment is published.
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
 		var att *attachment
 		var wsRef atomic.Pointer[websocket.Conn]
 		if s.rs != nil {
 			var err error
 			att, err = s.att.attach(attachBoth, func() {
+				// interruptOut wakes a writer parked on the outbound pipe;
+				// cancellation tells it this is attachment replacement, not
+				// the harmless ack/state nudge that it should otherwise ignore.
+				cancel()
 				if c := wsRef.Load(); c != nil {
 					c.CloseNow()
 				}
@@ -137,14 +150,6 @@ func WebSocketHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler 
 			s.rs.resetAck()
 		}
 
-		// Not r.Context(): coder/websocket's Accept doc warns that using the
-		// request context after Accept returns "may lead to unexpected
-		// behavior" (it has hijacked the connection out from under net/http
-		// by that point). The pumps below need no signal from it anyway —
-		// clean shutdown already arrives through s.toClient/s.toServer
-		// closing (see closeSession), and an abrupt disconnect already
-		// surfaces as a Read/Write error on c itself.
-		ctx := context.Background()
 		idle := cfg.HeartbeatInterval + defaultStreamReadGrace
 
 		// wg tracks both pumps to completion; readErrCh/writeErrCh exist only
@@ -166,6 +171,12 @@ func WebSocketHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler 
 		select {
 		case firstErr = <-readErrCh:
 		case firstErr = <-writeErrCh:
+		}
+		cancel()
+		// A resumable writer may be parked in nextOut, which has no context
+		// to observe. Wake it so cancellation can make it return promptly.
+		if s.rs != nil {
+			s.rs.interruptOut()
 		}
 
 		if errors.Is(firstErr, io.EOF) {
@@ -300,6 +311,9 @@ func wsWritePumpResumable(ctx context.Context, c *websocket.Conn, s *Session, cf
 		case errors.Is(err, io.EOF):
 			return io.EOF
 		case errors.Is(err, errPipeInterrupted):
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if !s.att.isCurrent(att) {
 				return errDetached
 			}

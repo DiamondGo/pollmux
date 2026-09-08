@@ -648,6 +648,80 @@ func TestWebSocketServerInterruptWithoutAckKeepsCurrentAttachment(t *testing.T) 
 	}
 }
 
+// Resume must also be able to kick that same idle write pump off the old
+// WebSocket. The kick closes the socket and interrupts nextOut; cancellation
+// is what distinguishes it from the harmless interrupt covered above. Without
+// that cancellation the write pump parks in nextOut again, the attachment
+// never detaches, and every resume attempt receives 503.
+func TestResumeKicksIdleWebSocketAttachment(t *testing.T) {
+	cfg := testResumeServerConfig()
+	// Keep the heartbeat beyond detachWait: a periodic wake-up can otherwise
+	// hide the stuck attachment by eventually attempting a write to the socket
+	// that the kick already closed.
+	cfg.HeartbeatInterval = 30 * time.Second
+	cfg.StreamMaxDuration = 2 * time.Minute
+	ts, st := newResumeTestServer(t, cfg, Hooks{})
+	resp, cr := postConnect(t, ts, ConnectRequest{
+		ProtocolVersion: ProtocolVersion,
+		PreferWebSocket: true,
+		PreferResume:    true,
+	})
+	if resp.StatusCode != http.StatusOK || !cr.Resumable {
+		t.Fatalf("connect = %d resumable=%v, want a resumable WebSocket", resp.StatusCode, cr.Resumable)
+	}
+	ws := dialWS(t, ts, cr.SessionID)
+
+	// Send one frame as an explicit readiness signal, then leave the server
+	// write pump parked with neither new data nor an ack due — the exact state
+	// in which CloseNow alone cannot wake it. A long heartbeat keeps a periodic
+	// wake-up from masking the failure.
+	s, _ := st.Get(cr.SessionID)
+	if _, err := s.Write([]byte("ready")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, msg, err := ws.Read(ctx)
+	cancel()
+	if err != nil {
+		t.Fatalf("readiness frame: %v", err)
+	}
+	if typ, _, err := wsDecode(msg); err != nil || typ != frameSeqData {
+		t.Fatalf("readiness frame = (%v, %v), want sequenced data", typ, err)
+	}
+
+	resp, _ = postResume(t, ts, cr.SessionID, ResumeRequest{ProtocolVersion: ProtocolVersion})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("resume status = %d, want 200 (old WebSocket attachment did not detach)", resp.StatusCode)
+	}
+
+	// The handshake leaves the session detached; a replacement WebSocket must
+	// be able to claim it and become usable immediately.
+	replacement := dialWS(t, ts, cr.SessionID)
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for {
+		_, msg, err = replacement.Read(ctx)
+		if err != nil {
+			t.Fatalf("replacement frame: %v", err)
+		}
+		typ, payload, err := wsDecode(msg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if typ == frameAck {
+			continue
+		}
+		if typ != frameSeqData {
+			t.Fatalf("replacement frame type = %v, want ack or sequenced data", typ)
+		}
+		off, data, err := splitSeq(payload)
+		if err != nil || off != 0 || string(data) != "ready" {
+			t.Fatalf("replacement data = (offset %d, %q, %v), want (0, ready, nil)", off, data, err)
+		}
+		break
+	}
+}
+
 // ---------------------------------------------------------------------------
 // end to end, through a proxy that breaks
 // ---------------------------------------------------------------------------
