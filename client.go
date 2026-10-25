@@ -142,14 +142,11 @@ type Connector struct {
 	// PreferResume asks the server to make the session resumable: if the
 	// transport later fails, the Conn resumes the same session (see
 	// ResumeHandler) instead of surfacing TransportFailed, and the yamux
-	// session on top of it — with every stream in it — carries on. Only
-	// honoured for WebSocket transport or stream mode in both directions;
-	// ignored by a server with ServerConfig.EnableResume off, or an older
-	// server, with no visible difference to the caller. With
-	// UploadStreamPreference on auto, a failed upload probe means the
-	// connection falls back to a non-resumable one (it reconnects once,
-	// without asking for resume), since the probe's fallback — discrete
-	// uploads — cannot be resumed.
+	// session on top of it — with every stream in it — carries on. Supported
+	// for WebSocket and HTTP batch/stream directions. Older servers may only
+	// support two-way streams and WebSocket, or ignore resume entirely. A
+	// failed auto upload probe reconnects with batch uploads, retaining resume
+	// if the server advertised BatchResume support.
 	PreferResume bool
 	// MaxReplayBytes caps how much unacknowledged data each direction of a
 	// resumable connection retains for replay; beyond it the connection
@@ -191,13 +188,12 @@ func (c *Connector) logger() *slog.Logger {
 
 // Connect registers with the server and returns a ready virtual connection.
 func (c *Connector) Connect(ctx context.Context) (Conn, error) {
-	return c.connect(ctx, c.PreferResume)
+	return c.connect(ctx, c.PreferResume, false)
 }
 
-// connect is Connect with the resume preference as a parameter, so the one
-// case where a resumable connect has to be redone without resume (an upload
-// probe failing, see below) can recurse exactly once.
-func (c *Connector) connect(ctx context.Context, preferResume bool) (Conn, error) {
+// connect can retry once with batch uploads after an unsuccessful stream probe,
+// without mutating the caller's Connector or losing resume on capable servers.
+func (c *Connector) connect(ctx context.Context, preferResume, forceBatchUpload bool) (Conn, error) {
 	if c.BaseURL == "" {
 		return nil, errors.New("pollmux: Connector.BaseURL is required")
 	}
@@ -226,7 +222,7 @@ func (c *Connector) connect(ctx context.Context, preferResume bool) (Conn, error
 		CheckRedirect: noRedirect,
 	}
 
-	cr, err := c.doConnect(ctx, connectClient, base, preferResume)
+	cr, err := c.doConnect(ctx, connectClient, base, preferResume, forceBatchUpload)
 	if err != nil {
 		return nil, err
 	}
@@ -236,15 +232,13 @@ func (c *Connector) connect(ctx context.Context, preferResume bool) (Conn, error
 	}
 
 	if cr.Resumable {
-		// The server only negotiates this for WebSocket or two-way stream
-		// mode; anything else is a server bug, and the grace is the client's
-		// retry budget, so both are checked the same way the stream-mode
-		// limits are below.
+		// The grace is the retry budget. Older servers may resume only streams
+		// or WebSocket; batch needs an explicit capability acknowledgement.
 		if cr.Limits.ResumeGraceMS <= 0 {
 			return nil, fmt.Errorf("pollmux: server negotiated a resumable session but sent non-positive resume_grace_ms=%d",
 				cr.Limits.ResumeGraceMS)
 		}
-		if cr.Transport != TransportWebSocket && (cr.PollMode != PollModeStream || cr.UploadStreamMode != PollModeStream) {
+		if cr.Transport != TransportWebSocket && !cr.BatchResume && (cr.PollMode != PollModeStream || cr.UploadStreamMode != PollModeStream) {
 			return nil, fmt.Errorf("pollmux: server negotiated a resumable session on transport=%q poll_mode=%q upload_stream_mode=%q, "+
 				"which cannot be resumed", cr.Transport, cr.PollMode, cr.UploadStreamMode)
 		}
@@ -297,6 +291,10 @@ func (c *Connector) connect(ctx context.Context, preferResume bool) (Conn, error
 			c.PollInterval, cycle, cr.Limits.PollTimeout(), cr.Limits.SessionTimeout(),
 		)
 	}
+	if cr.Resumable && negotiatedMode == PollModeBatch && !negotiatedUpload && c.PollInterval >= cr.Limits.ResumeGrace() {
+		return nil, fmt.Errorf("pollmux: PollInterval=%v reaches resume_grace=%v; a healthy batch session would expire between polls",
+			c.PollInterval, cr.Limits.ResumeGrace())
+	}
 
 	// The server is authoritative: we may clamp down, never up. This is what
 	// makes an oversized request impossible from a well-behaved client, and in
@@ -307,24 +305,18 @@ func (c *Connector) connect(ctx context.Context, preferResume bool) (Conn, error
 	logger := c.logger().With("session_id", cr.SessionID)
 
 	if cr.Resumable {
-		// Two-way stream mode, negotiated resumable. The reliable layer
-		// needs the upload leg to actually be a send-stream, so the auto
-		// probe runs first, exactly as it would for a plain stream
-		// connection; if the path fails it, this session is useless (its
-		// fallback, discrete uploads, cannot be resumed) — drop it and
-		// connect again without asking for resume.
-		if c.UploadStreamPreference == "" {
+		// Probe only streamed uploads. A failed probe needs a fresh negotiation,
+		// since the existing session's upload mode is immutable.
+		if negotiatedUpload && c.UploadStreamPreference == "" {
 			probeTimeout := orDuration(c.UploadProbeTimeout, DefaultUploadProbeTimeout)
 			probeClient := &http.Client{Transport: c.newTransport(dialTimeout, cr.Limits.StreamMaxDuration()+pollGrace), CheckRedirect: noRedirect}
 			ok := probeUploadStream(ctx, probeClient, fmt.Sprintf("%s/%s/poll", base, cr.SessionID), c.AuthToken, probeTimeout)
 			probeClient.CloseIdleConnections()
 			if !ok {
-				logger.Warn("pollmux: upload-stream probe did not pass within timeout; "+
-					"a resumable session needs streamed uploads, so reconnecting without resume — "+
-					"a proxy on this path likely buffers a long-lived request body instead of forwarding it live",
+				logger.Warn("pollmux: upload-stream probe did not pass; reconnecting with batch uploads",
 					"probe_timeout", probeTimeout)
 				c.deleteSession(base, cr.SessionID, connectClient)
-				return c.connect(ctx, false)
+				return c.connect(ctx, cr.BatchResume, true)
 			}
 		}
 		return c.connectResumable(ctx, base, cr, dialTimeout, sendTimeout, pollGrace, coalesce)
@@ -458,14 +450,16 @@ func (c *Connector) newTransport(dialTimeout, responseHeaderTimeout time.Duratio
 }
 
 // doConnect performs POST {prefix}/connect and parses the response.
-func (c *Connector) doConnect(ctx context.Context, client *http.Client, base string, preferResume bool) (*ConnectResponse, error) {
+func (c *Connector) doConnect(ctx context.Context, client *http.Client, base string, preferResume, forceBatchUpload bool) (*ConnectResponse, error) {
 	body, err := json.Marshal(ConnectRequest{
 		ProtocolVersion:    ProtocolVersion,
 		Meta:               c.Meta,
 		PreferStreamMode:   c.PreferStream,
-		PreferStreamUpload: c.UploadStreamPreference != PollModeBatch,
+		PreferStreamUpload: !forceBatchUpload && c.UploadStreamPreference != PollModeBatch,
 		PreferWebSocket:    c.PreferWebSocket,
 		PreferResume:       preferResume,
+		BatchResume:        preferResume,
+		PollIntervalMS:     c.PollInterval.Milliseconds(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pollmux: failed to encode connect request: %w", err)

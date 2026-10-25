@@ -189,6 +189,11 @@ func TestConnectNegotiatesResumeOnlyForResumableTransports(t *testing.T) {
 		{"download-only stream", nil, ConnectRequest{PreferStreamMode: true, PreferResume: true}, false},
 		{"upload-only stream", nil, ConnectRequest{PreferStreamUpload: true, PreferResume: true}, false},
 		{"batch", nil, ConnectRequest{PreferResume: true}, false},
+		{"batch with capability", nil, ConnectRequest{PreferResume: true, BatchResume: true}, true},
+		{"download-only stream with capability", nil, ConnectRequest{PreferStreamMode: true, PreferResume: true, BatchResume: true}, true},
+		{"upload-only stream with capability", nil, ConnectRequest{PreferStreamUpload: true, PreferResume: true, BatchResume: true}, true},
+		{"batch capability alone", nil, ConnectRequest{BatchResume: true}, false},
+		{"batch server has resume off", func(c *ServerConfig) { c.EnableResume = false }, ConnectRequest{PreferResume: true, BatchResume: true}, false},
 		{"client does not ask", nil, ConnectRequest{PreferStreamMode: true, PreferStreamUpload: true}, false},
 		{"server has resume off", func(c *ServerConfig) { c.EnableResume = false },
 			ConnectRequest{PreferStreamMode: true, PreferStreamUpload: true, PreferResume: true}, false},
@@ -210,6 +215,9 @@ func TestConnectNegotiatesResumeOnlyForResumableTransports(t *testing.T) {
 			if cr.Resumable != tc.want {
 				t.Fatalf("Resumable = %v, want %v (transport=%q poll_mode=%q upload=%q)",
 					cr.Resumable, tc.want, cr.Transport, cr.PollMode, cr.UploadStreamMode)
+			}
+			if cr.BatchResume != (tc.want && tc.req.BatchResume) {
+				t.Fatalf("BatchResume = %v, want %v", cr.BatchResume, tc.want && tc.req.BatchResume)
 			}
 			if tc.want && cr.Limits.ResumeGrace() != cfg.ResumeGrace {
 				t.Fatalf("resume_grace_ms = %v, want %v", cr.Limits.ResumeGrace(), cfg.ResumeGrace)
@@ -247,7 +255,7 @@ func TestResumeHandlerStatuses(t *testing.T) {
 		t.Fatalf("unknown session = %d, want 404", resp.StatusCode)
 	}
 
-	plain := connectOK(t, ts) // batch: never resumable
+	plain := connectOK(t, ts) // no resume requested
 	if resp, _ := postResume(t, ts, plain.SessionID, ResumeRequest{ProtocolVersion: ProtocolVersion}); resp.StatusCode != http.StatusConflict {
 		t.Fatalf("non-resumable session = %d, want 409", resp.StatusCode)
 	}
@@ -578,6 +586,30 @@ func TestResumeStabilityGuardAbandonsConsecutiveFastLegs(t *testing.T) {
 	}
 }
 
+func TestResumeStabilityGuardBodyTimeouts(t *testing.T) {
+	var g resumeStabilityGuard
+	for i := 1; i < maxConsecutiveBatchBodyTimeouts; i++ {
+		if g.recordBodyTimeout(true, false) {
+			t.Fatalf("guard abandoned after %d body timeouts, want %d", i, maxConsecutiveBatchBodyTimeouts)
+		}
+	}
+	if g.recordBodyTimeout(true, true) {
+		t.Fatal("a body timeout after delivering bytes must reset, not trip, the guard")
+	}
+	for i := 1; i < maxConsecutiveBatchBodyTimeouts; i++ {
+		g.recordBodyTimeout(true, false)
+	}
+	if g.recordBodyTimeout(false, false) {
+		t.Fatal("a leg ending for another reason must reset, not trip, the guard")
+	}
+	for i := 1; i < maxConsecutiveBatchBodyTimeouts; i++ {
+		g.recordBodyTimeout(true, false)
+	}
+	if !g.recordBodyTimeout(true, false) {
+		t.Fatalf("guard did not abandon after %d consecutive unproductive body timeouts", maxConsecutiveBatchBodyTimeouts)
+	}
+}
+
 func TestResumeStabilityGuardStableOrProductiveLegResetsCounter(t *testing.T) {
 	var g resumeStabilityGuard
 	for i := 0; i < maxConsecutiveFastResumes-1; i++ {
@@ -864,6 +896,9 @@ func newResumeE2E(t *testing.T, mode string, tweak func(*ServerConfig), middlewa
 			ResumeGrace:       3 * time.Second,
 		},
 	}
+	if mode == PollModeBatch {
+		e.cfg.PollMode = PollModeBatch
+	}
 	if tweak != nil {
 		tweak(&e.cfg)
 	}
@@ -923,10 +958,13 @@ func (e *resumeE2E) connector(tweak func(*Connector)) *Connector {
 		PollGrace:              300 * time.Millisecond,
 		SendTimeout:            time.Second,
 		DialTimeout:            time.Second,
-		PreferStream:           true,
+		PreferStream:           e.mode != PollModeBatch && e.mode != "batch-stream",
 		UploadStreamPreference: PollModeStream,
 		PreferWebSocket:        e.mode == TransportWebSocket,
 		PreferResume:           true,
+	}
+	if e.mode == PollModeBatch || e.mode == "stream-batch" {
+		c.UploadStreamPreference = PollModeBatch
 	}
 	if tweak != nil {
 		tweak(c)
@@ -1315,9 +1353,8 @@ func TestE2EResumeStaysOffWhenClientDoesNotAsk(t *testing.T) {
 	}
 }
 
-// Auto upload probe fails on a resumable connect: the client cannot run the
-// reliable layer over discrete uploads, so it drops that session and
-// connects again without resume — one session left, one clean delete.
+// A failed upload probe renegotiates batch uploads without giving up resume
+// on a server that supports the numbered batch protocol.
 func TestE2EResumeFallsBackWhenUploadProbeFails(t *testing.T) {
 	stall := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1336,24 +1373,37 @@ func TestE2EResumeFallsBackWhenUploadProbeFails(t *testing.T) {
 		})
 	}
 	e := newResumeE2E(t, PollModeStream, nil, stall)
-	conn, _ := e.dial(t, func(c *Connector) {
+	conn, sess := e.dial(t, func(c *Connector) {
 		c.UploadStreamPreference = ""
 		c.UploadProbeTimeout = 300 * time.Millisecond
 	})
-	if _, ok := conn.(*resumableConn); ok {
-		t.Fatal("kept a resumable conn after the probe failed")
-	}
-	hc, ok := conn.(*httpConn)
-	if !ok || hc.uploadStreamMode {
-		t.Fatalf("fallback conn = %T (uploadStreamMode=%v), want *httpConn on discrete uploads", conn, ok && hc.uploadStreamMode)
+	rc, ok := conn.(*resumableConn)
+	if !ok || rc.uploadStream || !rc.pollStream {
+		t.Fatalf("fallback conn = %T, want resumable stream download with batch upload", conn)
 	}
 	waitFor(t, 2*time.Second, func() bool { return e.store.Len() == 1 })
 	if r := e.reasons(); len(r) != 1 || r[0] != ReasonClientDelete {
 		t.Fatalf("disconnects = %v, want the abandoned session deleted once", r)
 	}
 	s, _ := e.store.Get(conn.SessionID())
-	if s.Resumable() {
-		t.Fatal("the replacement session must not be resumable")
+	if !s.Resumable() {
+		t.Fatal("the replacement session must remain resumable")
+	}
+	stream, err := sess.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	stream.SetDeadline(time.Now().Add(10 * time.Second))
+	stream.Write([]byte("before"))
+	buf := make([]byte, 6)
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		t.Fatal(err)
+	}
+	e.proxy.killAll()
+	stream.Write([]byte("after!"))
+	if _, err := io.ReadFull(stream, buf); err != nil || string(buf) != "after!" {
+		t.Fatalf("fallback stream did not survive a kill: %q, %v", buf, err)
 	}
 }
 
@@ -1594,5 +1644,37 @@ func TestRelayStreamDiesOnKillWithoutResume(t *testing.T) {
 	}
 	if second := waitForNewSession(t, c.sessions, first); second == first {
 		t.Fatal("consumer reused the dead session id")
+	}
+}
+
+// Grace is enforced at attach time, not only by the sweeper: a session past it
+// must not be revived by a request that beats the next sweep.
+func TestResumeExpiredGraceRefusesLateAttach(t *testing.T) {
+	expire := func(s *Session) {
+		s.mu.Lock()
+		s.detachedAt = time.Now().Add(-2 * s.resumeGrace)
+		s.mu.Unlock()
+	}
+	ts, st := newResumeTestServer(t, testResumeServerConfig(), Hooks{})
+
+	cr := connectResumableBatch(t, ts)
+	s, _ := st.Get(cr.SessionID)
+	expire(s)
+	if resp, _ := postResume(t, ts, cr.SessionID, ResumeRequest{ProtocolVersion: ProtocolVersion}); resp.StatusCode != http.StatusGone {
+		t.Fatalf("resume after grace = %d, want 410", resp.StatusCode)
+	}
+	if resp, _ := rawBatch(t, ts, cr.SessionID, false, 0, 0, nil); resp.StatusCode != http.StatusGone {
+		t.Fatalf("poll after grace = %d, want 410", resp.StatusCode)
+	}
+	if s.PollInFlight() != 0 {
+		t.Fatal("refused attach left the session marked active")
+	}
+
+	_, wcr := postConnect(t, ts, ConnectRequest{ProtocolVersion: ProtocolVersion, PreferWebSocket: true, PreferResume: true})
+	ws, _ := st.Get(wcr.SessionID)
+	expire(ws)
+	_, resp, err := websocket.Dial(context.Background(), ts.URL+"/tunnel/"+wcr.SessionID+"/ws", nil)
+	if err == nil || resp == nil || resp.StatusCode != http.StatusGone {
+		t.Fatalf("websocket after grace = (%v, %v), want 410", resp, err)
 	}
 }

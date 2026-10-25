@@ -42,6 +42,12 @@ const (
 	// server discards the frames instead of writing them upstream. Always
 	// sent together with HeaderSendStream, never alone.
 	HeaderSendStreamProbe = "X-Send-Stream-Probe"
+	// HeaderSendOffset is the absolute byte offset of a resumable batch body.
+	// It appears on send-only requests and on data-bearing poll responses.
+	HeaderSendOffset = "X-Send-Offset"
+	// HeaderRecvOffset acknowledges all bytes below this offset in the opposite
+	// direction. Every resumable batch request and successful response carries it.
+	HeaderRecvOffset = "X-Recv-Offset"
 )
 
 // Server-side defaults. See ServerConfig.
@@ -83,6 +89,12 @@ const (
 	// never needs to match anything the client declares, so it stays an
 	// unexported constant rather than a Limits field.
 	defaultStreamReadGrace = 10 * time.Second
+
+	// batchPollGapAllowance is how long, beyond its declared PollInterval, a
+	// resumable pure-batch session may sit between two polls before it counts
+	// as detached for MaxDetachedResumable: room for the response to drain,
+	// the client to turn it around, and the next request to arrive.
+	batchPollGapAllowance = 10 * time.Second
 )
 
 // Client-side defaults. See Connector.
@@ -169,10 +181,21 @@ type ConnectRequest struct {
 	PreferWebSocket bool `json:"prefer_websocket,omitempty"`
 	// PreferResume asks the server to make this session resumable across
 	// transport failures (see ConnectResponse.Resumable and reliable.go).
-	// Gated by ServerConfig.EnableResume and by the negotiated transport:
-	// only WebSocket, or stream mode in both directions, can be resumed. An
-	// old server ignores the field and the client works exactly as before.
+	// Gated by ServerConfig.EnableResume. Batch directions additionally require
+	// BatchResume, so clients predating that protocol keep their old behaviour.
+	// An old server ignores the field and the client works exactly as before.
 	PreferResume bool `json:"prefer_resume,omitempty"`
+	// BatchResume advertises support for numbered batch requests/responses.
+	// It does not enable resume on its own: PreferResume must also be true.
+	// Servers echo it only when resume is enabled for this session. Keeping it
+	// separate protects older resumable clients that only understand streams.
+	BatchResume bool `json:"batch_resume,omitempty"`
+	// PollIntervalMS is the client's idle pause between batch polls
+	// (Connector.PollInterval). A resumable pure-batch session has no request
+	// attached between polls, so the server uses this to avoid counting a
+	// healthy session against ServerConfig.MaxDetachedResumable. Clamped to the
+	// resume grace; ignored for every other transport.
+	PollIntervalMS int64 `json:"poll_interval_ms,omitempty"`
 }
 
 // ResumeRequest is the JSON body of POST {prefix}/{id}/resume, sent by a
@@ -291,6 +314,11 @@ type ConnectResponse struct {
 	// and reattaches through ResumeHandler instead of reconnecting. Empty
 	// from an older server; a client must treat that as false.
 	Resumable bool `json:"resumable,omitempty"`
+	// BatchResume confirms support for resumable batch directions, including
+	// falling back to discrete uploads when a stream-upload probe fails.
+	// Absent on older servers; their original stream/WebSocket resume remains
+	// usable, but batch directions must not be treated as resumable.
+	BatchResume bool `json:"batch_resume,omitempty"`
 }
 
 // errorResponse is the JSON body of any non-2xx answer from the handlers.

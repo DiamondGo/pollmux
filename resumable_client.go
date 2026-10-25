@@ -54,18 +54,22 @@ type resumableConn struct {
 
 	rl *reliable // out: yamux → server (writePipe); in: server → yamux (readPipe)
 
-	// transport is TransportWebSocket or PollModeStream — the only two the
-	// server will negotiate Resumable for.
-	transport string
-	pollURL   string
-	resumeURL string
-	deleteURL string
-	wsURL     string
-	authToken string
+	// HTTP directions independently use batch or stream. transport is only
+	// TransportWebSocket for a single bidirectional WebSocket attachment.
+	transport    string
+	pollStream   bool
+	uploadStream bool
+	maxSendChunk int
+	pollInterval time.Duration
+	pollURL      string
+	resumeURL    string
+	deleteURL    string
+	wsURL        string
+	authToken    string
 
-	// pollClient and sendStreamClient serve the stream-mode legs, with the
-	// same timeouts httpConn gives them; httpClient serves the short,
-	// bounded requests — resume, DELETE, and the WebSocket dial.
+	// pollClient handles batch or streamed downloads; sendStreamClient handles
+	// streamed uploads. httpClient serves bounded batch uploads, resume,
+	// DELETE, and the WebSocket dial.
 	pollClient       *http.Client
 	sendStreamClient *http.Client
 	httpClient       *http.Client
@@ -192,10 +196,27 @@ const (
 	// maxConsecutiveFastResumes bounds the otherwise unthrottled case where
 	// every resume handshake succeeds but its replacement legs fail at once.
 	maxConsecutiveFastResumes = 5
+	// maxConsecutiveBatchBodyTimeouts bounds the case the fast-resume guard
+	// cannot see: each leg lasts a whole poll deadline, but a batch response
+	// too large for the link never finishes, so nothing is ever delivered.
+	maxConsecutiveBatchBodyTimeouts = 3
 )
 
 type resumeStabilityGuard struct {
-	consecutiveFast int
+	consecutiveFast         int
+	consecutiveBodyTimeouts int
+}
+
+// recordBodyTimeout reports whether the session should be abandoned because
+// batch responses keep timing out mid-body without delivering anything. Any
+// downstream byte received, or a leg that ended for another reason, resets it.
+func (g *resumeStabilityGuard) recordBodyTimeout(bodyTimedOut, received bool) bool {
+	if !bodyTimedOut || received {
+		g.consecutiveBodyTimeouts = 0
+		return false
+	}
+	g.consecutiveBodyTimeouts++
+	return g.consecutiveBodyTimeouts >= maxConsecutiveBatchBodyTimeouts
 }
 
 // record reports whether the session should be abandoned after a successful
@@ -237,6 +258,16 @@ func (c *resumableConn) supervise() {
 		}
 		if errors.Is(err, errReplayGap) || errors.Is(err, errBadAck) || c.rl.isBroken() {
 			c.logger.Warn("pollmux: resumable session is no longer consistent, giving up on it", "error", err)
+			c.fail()
+			return
+		}
+		if stability.recordBodyTimeout(errors.Is(err, errBatchBodyTimeout), c.rl.recvOffsetNow() != progressBefore.recv) {
+			c.logger.Warn("pollmux: batch poll responses keep timing out before they finish arriving, abandoning session; "+
+				"poll_buffer_bytes is likely too large for this link's bandwidth",
+				"consecutive_body_timeouts", stability.consecutiveBodyTimeouts,
+				"poll_buffer_bytes", c.maxFrame,
+				"error", err,
+			)
 			c.fail()
 			return
 		}
@@ -285,8 +316,20 @@ func (c *resumableConn) runLegs() error {
 		go func() { errCh <- c.wsReadLoop(legCtx, ws) }()
 		go func() { errCh <- c.wsWriteLoop(legCtx, ws) }()
 	} else {
-		go func() { errCh <- c.downLoop(legCtx) }()
-		go func() { errCh <- c.upLoop(legCtx) }()
+		go func() {
+			if c.pollStream {
+				errCh <- c.downLoop(legCtx)
+			} else {
+				errCh <- c.batchDownLoop(legCtx)
+			}
+		}()
+		go func() {
+			if c.uploadStream {
+				errCh <- c.upLoop(legCtx)
+			} else {
+				errCh <- c.batchUpLoop(legCtx)
+			}
+		}()
 	}
 
 	err := <-errCh
@@ -729,6 +772,10 @@ func (c *Connector) connectResumable(ctx context.Context, base string, cr *Conne
 		logger:            logger,
 		rl:                newReliable(NewBufferedPipe(), NewBufferedPipe(), c.MaxReplayBytes),
 		transport:         cr.Transport,
+		pollStream:        cr.PollMode == PollModeStream,
+		uploadStream:      cr.UploadStreamMode == PollModeStream,
+		maxSendChunk:      min(orInt(c.MaxSendChunk, DefaultMaxSendChunk), cr.Limits.MaxSendBytes),
+		pollInterval:      c.PollInterval,
 		pollURL:           fmt.Sprintf("%s/%s/poll", base, cr.SessionID),
 		resumeURL:         fmt.Sprintf("%s/%s/resume", base, cr.SessionID),
 		deleteURL:         fmt.Sprintf("%s/%s", base, cr.SessionID),
@@ -761,9 +808,23 @@ func (c *Connector) connectResumable(ctx context.Context, base string, cr *Conne
 		}
 		conn.ws.Store(ws)
 	} else {
+		headerTimeout := pollGrace
 		conn.transport = PollModeStream
-		conn.pollClient = &http.Client{Transport: c.newTransport(dialTimeout, pollGrace), CheckRedirect: noRedirect}
-		conn.sendStreamClient = &http.Client{Transport: c.newTransport(dialTimeout, cr.Limits.StreamMaxDuration()+pollGrace), CheckRedirect: noRedirect}
+		if !conn.pollStream {
+			conn.transport = PollModeBatch
+			headerTimeout += cr.Limits.PollTimeout()
+		}
+		// Bound batch bodies too: ResponseHeaderTimeout alone cannot detect a
+		// peer that sends headers and then stalls halfway through the payload.
+		conn.pollClient = &http.Client{Transport: c.newTransport(dialTimeout, headerTimeout), CheckRedirect: noRedirect}
+		if !conn.pollStream {
+			conn.pollClient.Timeout = dialTimeout + headerTimeout
+			// Every poll request carries the downstream ack.
+			conn.rl.disableEagerAck()
+		}
+		if conn.uploadStream {
+			conn.sendStreamClient = &http.Client{Transport: c.newTransport(dialTimeout, cr.Limits.StreamMaxDuration()+pollGrace), CheckRedirect: noRedirect}
+		}
 	}
 
 	c.adoptSession(cr.SessionID)

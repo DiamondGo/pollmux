@@ -37,6 +37,10 @@ type Session struct {
 	// so PollHandler can read it with no lock, the same way it already
 	// treats meta as effectively immutable post-construction.
 	pollMode string
+	// uploadStream and batchResume are negotiated once, before publication.
+	// They keep legacy raw batch bodies out of the reliable byte stream.
+	uploadStream bool
+	batchResume  bool
 
 	// transport is "" or TransportWebSocket, set once by ConnectHandler
 	// alongside pollMode and likewise never mutated after. WebSocketHandler
@@ -78,6 +82,11 @@ type Session struct {
 	rs          *reliable
 	att         *attachments
 	resumeGrace time.Duration
+	// pollGap is how long a resumable pure-batch session normally goes with
+	// nothing attached between two polls; zero for every other transport.
+	// Only a session detached longer than this counts toward the sweeper's
+	// MaxDetachedResumable cap. Set before publication, never mutated after.
+	pollGap time.Duration
 
 	mu         sync.Mutex
 	lastActive time.Time
@@ -144,6 +153,22 @@ func (s *Session) inResumeGraceLocked(now time.Time) bool {
 		now.Sub(s.detachedAt) <= s.resumeGrace
 }
 
+// resumeExpiredLocked reports whether s is a detached resumable session whose
+// grace has run out but which the sweeper has not evicted yet. Such a session
+// must not be revived by a late attach. s.mu must be held.
+func (s *Session) resumeExpiredLocked(now time.Time) bool {
+	return s.rs != nil && s.pollInFlight == 0 && !s.rs.isBroken() &&
+		now.Sub(s.detachedAt) > s.resumeGrace
+}
+
+// detachedBeyondPollGapLocked reports whether s has had nothing attached for
+// longer than its transport's normal gap between requests, i.e. whether it is
+// really waiting for a resume rather than between two batch polls. s.mu must
+// be held.
+func (s *Session) detachedBeyondPollGapLocked(now time.Time) bool {
+	return s.pollInFlight == 0 && now.Sub(s.detachedAt) > s.pollGap
+}
+
 // watchHighWater arms the high-water warning on both pipes.
 func (s *Session) watchHighWater(threshold int, logger *slog.Logger) {
 	if threshold <= 0 || logger == nil {
@@ -201,11 +226,11 @@ func (s *Session) closePipes() {
 }
 
 // beginPoll atomically attaches a poll or persistent transport unless the
-// session has already been closed.
+// session has already been closed or its resume grace has expired.
 func (s *Session) beginPoll() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || s.resumeExpiredLocked(time.Now()) {
 		return false
 	}
 	s.pollInFlight++
@@ -230,7 +255,7 @@ func (s *Session) noteDetachedLocked() {
 func (s *Session) beginWebSocket() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.wsAttached {
+	if s.closed || s.wsAttached || s.resumeExpiredLocked(time.Now()) {
 		return false
 	}
 	s.wsAttached = true
@@ -249,6 +274,14 @@ func (s *Session) endWebSocket() {
 // writeUpstream queues data the client sent for the application to read.
 func (s *Session) writeUpstream(p []byte) (int, error) {
 	return s.toServer.Write(p)
+}
+
+// refusesAttach reports whether every future attach will be refused: the
+// session is closed, or it is resumable and its grace expired while detached.
+func (s *Session) refusesAttach() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed || s.resumeExpiredLocked(time.Now())
 }
 
 // IsClosed reports whether Close has been called.

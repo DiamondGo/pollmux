@@ -54,7 +54,7 @@ type reliable struct {
 
 	recvOffset uint64 // contiguous bytes written to in
 	lastAck    uint64 // recvOffset as of the last ack handed out by takeAck
-	ackEager   int    // interrupt out's waiter once this much is unacknowledged
+	ackEager   int    // interrupt out's waiter once this much is unacknowledged; 0 disables
 }
 
 // ackEagerBytes is how much newly received data prompts an immediate ack
@@ -69,6 +69,14 @@ func newReliable(out, in *BufferedPipe, maxReplay int) *reliable {
 		maxReplay = DefaultMaxReplayBytes
 	}
 	return &reliable{out: out, in: in, maxReplay: maxReplay, ackEager: ackEagerBytes}
+}
+
+// disableEagerAck stops recvIn from waking the sending side to carry an ack.
+// For a receive direction carried by batch requests or responses: each one
+// already reports the cumulative ack, so an early wakeup only adds a request.
+// Called before the layer is shared, never after.
+func (r *reliable) disableEagerAck() {
+	r.ackEager = 0
 }
 
 // nextOut returns the next chunk for the attached transport to send and the
@@ -136,7 +144,7 @@ func (r *reliable) recvIn(off uint64, p []byte) error {
 		return err
 	}
 	r.recvOffset += uint64(len(p))
-	wake := r.recvOffset-r.lastAck >= uint64(r.ackEager)
+	wake := r.ackEager > 0 && r.recvOffset-r.lastAck >= uint64(r.ackEager)
 	r.mu.Unlock()
 
 	if wake {
@@ -213,6 +221,20 @@ func (r *reliable) resumeOut(peerRecv uint64) bool {
 	r.ackedOffset = peerRecv
 	r.sentCursor = peerRecv
 	return true
+}
+
+// rewindToAcked makes the next nextOut resend everything the peer has not
+// acknowledged. Only valid for a direction whose transport carries at most one
+// response at a time and opens each request with a cumulative ack (batch
+// polls): there, anything sent but not acked was lost along with its response,
+// even when no resume handshake follows, as with a stale request that attached
+// late and answered a peer no longer listening.
+func (r *reliable) rewindToAcked() {
+	r.mu.Lock()
+	if !r.broken {
+		r.sentCursor = r.ackedOffset
+	}
+	r.mu.Unlock()
 }
 
 // recvOffsetNow is what this end reports in a resume handshake.
