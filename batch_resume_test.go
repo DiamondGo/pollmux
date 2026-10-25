@@ -534,8 +534,83 @@ func TestBatchResumeClientBoundsStalledResponseBody(t *testing.T) {
 	client := ts.Client()
 	client.Timeout = 50 * time.Millisecond
 	c := &resumableConn{rl: newReliable(NewBufferedPipe(), NewBufferedPipe(), 1024), pollClient: client, pollURL: ts.URL, maxFrame: 16}
-	if _, err := c.doBatchPoll(context.Background()); err == nil || !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := c.doBatchPoll(context.Background()); err == nil || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, errBatchBodyTimeout) {
 		t.Fatalf("stalled body error = %v", err)
+	}
+}
+
+// Only a deadline counts toward the body-timeout guard; a body cut short by
+// the connection closing is an ordinary transport failure.
+func TestBatchResumeClientTruncatedBodyIsNotABodyTimeout(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setBatchOffset(w.Header(), HeaderRecvOffset, 0)
+		setBatchOffset(w.Header(), HeaderSendOffset, 0)
+		w.Header().Set("Content-Length", strconv.Itoa(10))
+		w.WriteHeader(200)
+		io.WriteString(w, "abc")
+	}))
+	defer ts.Close()
+	client := ts.Client()
+	client.Timeout = 5 * time.Second
+	c := &resumableConn{rl: newReliable(NewBufferedPipe(), NewBufferedPipe(), 1024), pollClient: client, pollURL: ts.URL, maxFrame: 16}
+	if _, err := c.doBatchPoll(context.Background()); err == nil || errors.Is(err, errBatchBodyTimeout) {
+		t.Fatalf("truncated body error = %v, want a non-timeout failure", err)
+	}
+}
+
+type trickleWriter struct {
+	http.ResponseWriter
+}
+
+func (w trickleWriter) Write(p []byte) (int, error) {
+	n := 0
+	for len(p) > 0 {
+		k := min(len(p), 1<<10)
+		m, err := w.ResponseWriter.Write(p[:k])
+		n += m
+		if err == nil {
+			err = http.NewResponseController(w.ResponseWriter).Flush()
+		}
+		if err != nil {
+			return n, err
+		}
+		p = p[k:]
+		time.Sleep(50 * time.Millisecond)
+	}
+	return n, nil
+}
+
+func (w trickleWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// A batch the link cannot carry within the poll deadline times out on every
+// replay. Each leg outlasts resumableLegsMinStable, so only the body-timeout
+// guard can end the loop instead of resuming forever.
+func TestBatchResumeAbandonsSessionWhoseBatchesNeverFinish(t *testing.T) {
+	mw := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get(HeaderReceiveOnly) == "true" {
+				w = trickleWriter{w}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	e := newResumeE2E(t, PollModeBatch, nil, mw)
+	conn, sess := e.dial(t, func(c *Connector) { c.PollGrace = time.Second })
+	stream, err := sess.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	// Echoed back as about 64 KiB of downstream batches: 3 s or more each at
+	// the trickle rate, against a 2.5 s whole-request poll deadline.
+	go stream.Write(bytes.Repeat([]byte("x"), 64<<10))
+	select {
+	case <-conn.TransportFailed():
+	case <-time.After(30 * time.Second):
+		t.Fatalf("session kept resuming; resumes = %d", e.resumes.Load())
+	}
+	if got := e.resumes.Load(); got != maxConsecutiveBatchBodyTimeouts-1 {
+		t.Fatalf("resumes before abandoning = %d, want %d", got, maxConsecutiveBatchBodyTimeouts-1)
 	}
 }
 

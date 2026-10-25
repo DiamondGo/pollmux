@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -27,6 +28,12 @@ func batchOffset(h http.Header, name string) (uint64, error) {
 	}
 	return n, nil
 }
+
+// errBatchBodyTimeout is doBatchPoll's report that a 200 response started but
+// its body did not finish within the poll deadline. Resuming replays the same
+// batch, so on a link too slow for poll_buffer_bytes this repeats forever
+// unless supervise gives up (see resumeStabilityGuard.recordBodyTimeout).
+var errBatchBodyTimeout = errors.New("pollmux: batch poll response body did not finish within the poll deadline")
 
 func setBatchOffset(h http.Header, name string, off uint64) {
 	h.Set(name, strconv.FormatUint(off, 10))
@@ -199,6 +206,10 @@ func (c *resumableConn) doBatchPoll(ctx context.Context) (bool, error) {
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(c.maxFrame)+1))
 	if err != nil {
+		var ne net.Error
+		if resp.StatusCode == http.StatusOK && errors.As(err, &ne) && ne.Timeout() {
+			return false, fmt.Errorf("%w: %w", errBatchBodyTimeout, err)
+		}
 		return false, fmt.Errorf("pollmux: reading batch response: %w", err)
 	}
 	if len(data) > c.maxFrame {

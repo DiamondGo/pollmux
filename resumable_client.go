@@ -196,10 +196,27 @@ const (
 	// maxConsecutiveFastResumes bounds the otherwise unthrottled case where
 	// every resume handshake succeeds but its replacement legs fail at once.
 	maxConsecutiveFastResumes = 5
+	// maxConsecutiveBatchBodyTimeouts bounds the case the fast-resume guard
+	// cannot see: each leg lasts a whole poll deadline, but a batch response
+	// too large for the link never finishes, so nothing is ever delivered.
+	maxConsecutiveBatchBodyTimeouts = 3
 )
 
 type resumeStabilityGuard struct {
-	consecutiveFast int
+	consecutiveFast         int
+	consecutiveBodyTimeouts int
+}
+
+// recordBodyTimeout reports whether the session should be abandoned because
+// batch responses keep timing out mid-body without delivering anything. Any
+// downstream byte received, or a leg that ended for another reason, resets it.
+func (g *resumeStabilityGuard) recordBodyTimeout(bodyTimedOut, received bool) bool {
+	if !bodyTimedOut || received {
+		g.consecutiveBodyTimeouts = 0
+		return false
+	}
+	g.consecutiveBodyTimeouts++
+	return g.consecutiveBodyTimeouts >= maxConsecutiveBatchBodyTimeouts
 }
 
 // record reports whether the session should be abandoned after a successful
@@ -241,6 +258,16 @@ func (c *resumableConn) supervise() {
 		}
 		if errors.Is(err, errReplayGap) || errors.Is(err, errBadAck) || c.rl.isBroken() {
 			c.logger.Warn("pollmux: resumable session is no longer consistent, giving up on it", "error", err)
+			c.fail()
+			return
+		}
+		if stability.recordBodyTimeout(errors.Is(err, errBatchBodyTimeout), c.rl.recvOffsetNow() != progressBefore.recv) {
+			c.logger.Warn("pollmux: batch poll responses keep timing out before they finish arriving, abandoning session; "+
+				"poll_buffer_bytes is likely too large for this link's bandwidth",
+				"consecutive_body_timeouts", stability.consecutiveBodyTimeouts,
+				"poll_buffer_bytes", c.maxFrame,
+				"error", err,
+			)
 			c.fail()
 			return
 		}

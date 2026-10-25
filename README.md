@@ -142,7 +142,9 @@ HTTP uploads and downloads are independent requests to the poll endpoint:
 
 Uploads never wait for the downstream long poll. The default client poll interval is zero: waiting belongs inside the server's long poll, not an extra client sleep. A configured interval is applied after idle responses, not after data.
 
-For **resumable** batch polls, the header timeout is `poll_timeout_ms + PollGrace`. A whole-request timeout of `DialTimeout + poll timeout + PollGrace` also bounds body consumption: receiving headers and then stalling halfway through a response is a transport failure, not an indefinitely healthy poll. Batch uploads use the client's send timeout. See [resumable batch wire behavior](#resumable-batch-wire-behavior) for offsets and replay.
+For **resumable** batch polls, the header timeout is `poll_timeout_ms + PollGrace`. A whole-request timeout of `DialTimeout + poll timeout + PollGrace` also bounds body consumption: receiving headers and then stalling halfway through a response is a transport failure, not an indefinitely healthy poll. Batch uploads use the client's send timeout.
+
+**Size `poll_buffer_bytes` for the slowest link you support.** The whole-request timeout also covers the body transfer. Because yamux keepalive is disabled, it is the client's only stall detector for batch polls, so it deliberately does not stretch for slow bodies. Data that arrives near the end of a long poll leaves about `DialTimeout + PollGrace` to transfer a full batch. Keep `poll_buffer_bytes` within what the link carries in `PollGrace`, for example 256 KiB needs about 26 KB/s with the default 10 seconds. A batch that misses the deadline only costs a resume and a replay. But if a full batch cannot transfer within the whole deadline at all, every replay times out the same way. After three consecutive legs end with a response body timing out and no downstream bytes delivered, the client abandons the session and signals transport failure instead of resuming forever. See [resumable batch wire behavior](#resumable-batch-wire-behavior) for offsets and replay.
 
 ### Streamed HTTP downloads
 

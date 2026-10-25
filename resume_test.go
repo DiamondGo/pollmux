@@ -586,6 +586,30 @@ func TestResumeStabilityGuardAbandonsConsecutiveFastLegs(t *testing.T) {
 	}
 }
 
+func TestResumeStabilityGuardBodyTimeouts(t *testing.T) {
+	var g resumeStabilityGuard
+	for i := 1; i < maxConsecutiveBatchBodyTimeouts; i++ {
+		if g.recordBodyTimeout(true, false) {
+			t.Fatalf("guard abandoned after %d body timeouts, want %d", i, maxConsecutiveBatchBodyTimeouts)
+		}
+	}
+	if g.recordBodyTimeout(true, true) {
+		t.Fatal("a body timeout after delivering bytes must reset, not trip, the guard")
+	}
+	for i := 1; i < maxConsecutiveBatchBodyTimeouts; i++ {
+		g.recordBodyTimeout(true, false)
+	}
+	if g.recordBodyTimeout(false, false) {
+		t.Fatal("a leg ending for another reason must reset, not trip, the guard")
+	}
+	for i := 1; i < maxConsecutiveBatchBodyTimeouts; i++ {
+		g.recordBodyTimeout(true, false)
+	}
+	if !g.recordBodyTimeout(true, false) {
+		t.Fatalf("guard did not abandon after %d consecutive unproductive body timeouts", maxConsecutiveBatchBodyTimeouts)
+	}
+}
+
 func TestResumeStabilityGuardStableOrProductiveLegResetsCounter(t *testing.T) {
 	var g resumeStabilityGuard
 	for i := 0; i < maxConsecutiveFastResumes-1; i++ {
