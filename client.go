@@ -459,6 +459,7 @@ func (c *Connector) doConnect(ctx context.Context, client *http.Client, base str
 		PreferWebSocket:    c.PreferWebSocket,
 		PreferResume:       preferResume,
 		BatchResume:        preferResume,
+		PollIntervalMS:     c.PollInterval.Milliseconds(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pollmux: failed to encode connect request: %w", err)

@@ -82,6 +82,11 @@ type Session struct {
 	rs          *reliable
 	att         *attachments
 	resumeGrace time.Duration
+	// pollGap is how long a resumable pure-batch session normally goes with
+	// nothing attached between two polls; zero for every other transport.
+	// Only a session detached longer than this counts toward the sweeper's
+	// MaxDetachedResumable cap. Set before publication, never mutated after.
+	pollGap time.Duration
 
 	mu         sync.Mutex
 	lastActive time.Time
@@ -154,6 +159,14 @@ func (s *Session) inResumeGraceLocked(now time.Time) bool {
 func (s *Session) resumeExpiredLocked(now time.Time) bool {
 	return s.rs != nil && s.pollInFlight == 0 && !s.rs.isBroken() &&
 		now.Sub(s.detachedAt) > s.resumeGrace
+}
+
+// detachedBeyondPollGapLocked reports whether s has had nothing attached for
+// longer than its transport's normal gap between requests, i.e. whether it is
+// really waiting for a resume rather than between two batch polls. s.mu must
+// be held.
+func (s *Session) detachedBeyondPollGapLocked(now time.Time) bool {
+	return s.pollInFlight == 0 && now.Sub(s.detachedAt) > s.pollGap
 }
 
 // watchHighWater arms the high-water warning on both pipes.

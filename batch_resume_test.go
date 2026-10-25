@@ -831,3 +831,98 @@ func TestBatchResumeOlderServerUploadProbeFallback(t *testing.T) {
 		t.Fatalf("legacy fallback echo = %q, %v", buf, err)
 	}
 }
+
+// Healthy pure-batch clients have nothing attached between polls; they must
+// not be mistaken for the detached excess MaxDetachedResumable evicts.
+func TestBatchResumeDetachedCapSparesHealthyPollers(t *testing.T) {
+	e := newResumeE2E(t, PollModeBatch, func(c *ServerConfig) { c.MaxDetachedResumable = 2 }, nil)
+	for i := 0; i < 6; i++ {
+		e.dial(t, func(c *Connector) { c.PollInterval = 300 * time.Millisecond })
+	}
+	time.Sleep(2 * time.Second)
+	if n := e.store.Len(); n != 6 || len(e.reasons()) != 0 {
+		t.Fatalf("sessions = %d, disconnects = %v; healthy pollers were evicted", n, e.reasons())
+	}
+}
+
+// A pure-batch session counts toward the cap once it has been detached longer
+// than its declared poll interval plus the allowance; nothing earlier.
+func TestBatchResumeDetachedCapCountsAfterPollGap(t *testing.T) {
+	cfg := testResumeServerConfig()
+	cfg.ResumeGrace = time.Minute
+	ts, st := newResumeTestServer(t, cfg, Hooks{})
+	connect := func(interval time.Duration, detachedFor time.Duration) *Session {
+		_, cr := postConnect(t, ts, ConnectRequest{ProtocolVersion: ProtocolVersion, PreferResume: true, BatchResume: true,
+			PollIntervalMS: interval.Milliseconds()})
+		s, _ := st.Get(cr.SessionID)
+		s.mu.Lock()
+		s.detachedAt = time.Now().Add(-detachedFor)
+		s.mu.Unlock()
+		return s
+	}
+	oldest := connect(0, 40*time.Second)
+	gone := connect(0, 30*time.Second)
+	slowPoller := connect(25*time.Second, 30*time.Second)
+	betweenPolls := connect(0, time.Second)
+	st.maxDetachedResumable = 1
+	st.sweep(time.Hour, nil)
+	for _, tc := range []struct {
+		name string
+		s    *Session
+		want bool
+	}{{"oldest detached", oldest, true}, {"detached", gone, false}, {"within declared interval", slowPoller, false}, {"between polls", betweenPolls, false}} {
+		if tc.s.IsClosed() != tc.want {
+			t.Errorf("%s: evicted = %v, want %v", tc.name, tc.s.IsClosed(), tc.want)
+		}
+	}
+}
+
+// Acks ride on every batch request and response, so a bulk transfer must not
+// add ack-only uploads or early 204 polls to carry them.
+func TestBatchResumeAcksAddNoRequests(t *testing.T) {
+	var ackOnlyUploads, idlePolls atomic.Int64
+	mw := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get(HeaderSendOnly) == "true" && r.ContentLength == 0 {
+				ackOnlyUploads.Add(1)
+			}
+			if r.Header.Get(HeaderReceiveOnly) == "true" {
+				sw := &statusWriter{ResponseWriter: w}
+				next.ServeHTTP(sw, r)
+				if sw.status == http.StatusNoContent {
+					idlePolls.Add(1)
+				}
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	e := newResumeE2E(t, PollModeBatch, func(c *ServerConfig) { c.PollTimeout = 5 * time.Second; c.SessionTimeout = 10 * time.Second }, mw)
+	_, sess := e.dial(t, nil)
+	stream, err := sess.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	payload := bytes.Repeat([]byte("x"), 8<<20)
+	go stream.Write(payload)
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(stream, got); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("echo = %v", err)
+	}
+	if ackOnlyUploads.Load() != 0 || idlePolls.Load() != 0 {
+		t.Fatalf("ack-only uploads = %d, early 204 polls = %d; want none", ackOnlyUploads.Load(), idlePolls.Load())
+	}
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

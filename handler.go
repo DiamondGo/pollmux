@@ -128,8 +128,11 @@ type ServerConfig struct {
 	// MaxDetachedResumable caps how many resumable sessions may be waiting
 	// detached at once, bounding the memory a burst of disconnects — or a
 	// client that connects and vanishes on purpose — can hold. The sweeper
-	// evicts the longest-detached first. Defaults to
-	// DefaultMaxDetachedResumable; negative disables the cap.
+	// evicts the longest-detached first. A pure-batch session counts only
+	// after it has been detached longer than the client's declared
+	// PollInterval plus a fixed allowance, since between two healthy polls it
+	// has nothing attached. Defaults to DefaultMaxDetachedResumable; negative
+	// disables the cap.
 	MaxDetachedResumable int
 
 	// Logger receives diagnostics. Nil disables logging.
@@ -362,6 +365,15 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 		if resumable {
 			s.enableResume(cfg.MaxReplayBytes, cfg.ResumeGrace)
 			s.batchResume = req.BatchResume
+			if transport == "" && !s.uploadStream {
+				// Every upload response carries the upstream ack, so waking the
+				// download leg early to carry it would only cost a request.
+				s.rs.disableEagerAck()
+				if negotiatedMode == PollModeBatch {
+					ms := min(max(req.PollIntervalMS, 0), cfg.ResumeGrace.Milliseconds())
+					s.pollGap = time.Duration(ms)*time.Millisecond + batchPollGapAllowance
+				}
+			}
 		}
 
 		// Register before the callback. The client's first poll can beat

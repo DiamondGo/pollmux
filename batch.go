@@ -242,8 +242,10 @@ func (c *resumableConn) batchUpLoop(ctx context.Context) error {
 		if err != nil && !errors.Is(err, errPipeInterrupted) {
 			return err
 		}
+		// An ack-only upload is only needed when downloads stream; batch polls
+		// carry the ack themselves.
 		_, due := c.rl.takeAck()
-		if n == 0 && !due {
+		if n == 0 && (!due || !c.pollStream) {
 			continue
 		}
 		if err := c.doBatchSend(ctx, off, buf[:n]); err != nil {

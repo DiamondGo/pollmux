@@ -54,7 +54,7 @@ type reliable struct {
 
 	recvOffset uint64 // contiguous bytes written to in
 	lastAck    uint64 // recvOffset as of the last ack handed out by takeAck
-	ackEager   int    // interrupt out's waiter once this much is unacknowledged
+	ackEager   int    // interrupt out's waiter once this much is unacknowledged; 0 disables
 }
 
 // ackEagerBytes is how much newly received data prompts an immediate ack
@@ -69,6 +69,14 @@ func newReliable(out, in *BufferedPipe, maxReplay int) *reliable {
 		maxReplay = DefaultMaxReplayBytes
 	}
 	return &reliable{out: out, in: in, maxReplay: maxReplay, ackEager: ackEagerBytes}
+}
+
+// disableEagerAck stops recvIn from waking the sending side to carry an ack.
+// For a receive direction carried by batch requests or responses: each one
+// already reports the cumulative ack, so an early wakeup only adds a request.
+// Called before the layer is shared, never after.
+func (r *reliable) disableEagerAck() {
+	r.ackEager = 0
 }
 
 // nextOut returns the next chunk for the attached transport to send and the
@@ -136,7 +144,7 @@ func (r *reliable) recvIn(off uint64, p []byte) error {
 		return err
 	}
 	r.recvOffset += uint64(len(p))
-	wake := r.recvOffset-r.lastAck >= uint64(r.ackEager)
+	wake := r.ackEager > 0 && r.recvOffset-r.lastAck >= uint64(r.ackEager)
 	r.mu.Unlock()
 
 	if wake {

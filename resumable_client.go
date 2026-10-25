@@ -792,6 +792,8 @@ func (c *Connector) connectResumable(ctx context.Context, base string, cr *Conne
 		conn.pollClient = &http.Client{Transport: c.newTransport(dialTimeout, headerTimeout), CheckRedirect: noRedirect}
 		if !conn.pollStream {
 			conn.pollClient.Timeout = dialTimeout + headerTimeout
+			// Every poll request carries the downstream ack.
+			conn.rl.disableEagerAck()
 		}
 		if conn.uploadStream {
 			conn.sendStreamClient = &http.Client{Transport: c.newTransport(dialTimeout, cr.Limits.StreamMaxDuration()+pollGrace), CheckRedirect: noRedirect}

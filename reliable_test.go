@@ -233,6 +233,17 @@ func TestReliableEagerAckInterruptsSender(t *testing.T) {
 	}
 }
 
+func TestReliableDisabledEagerAckLeavesSenderParked(t *testing.T) {
+	r := newTestReliable(1 << 20)
+	r.disableEagerAck()
+	if err := r.recvIn(0, bytes.Repeat([]byte("x"), 2*ackEagerBytes)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.nextOut(make([]byte, 64), 20*time.Millisecond, time.Millisecond); err != nil {
+		t.Fatalf("sender woke with %v, want a plain timeout", err)
+	}
+}
+
 // --- BufferedPipe.interrupt ----------------------------------------------------
 
 func TestBufferedPipeInterruptCutsWaitShort(t *testing.T) {

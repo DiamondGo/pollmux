@@ -89,6 +89,12 @@ const (
 	// never needs to match anything the client declares, so it stays an
 	// unexported constant rather than a Limits field.
 	defaultStreamReadGrace = 10 * time.Second
+
+	// batchPollGapAllowance is how long, beyond its declared PollInterval, a
+	// resumable pure-batch session may sit between two polls before it counts
+	// as detached for MaxDetachedResumable: room for the response to drain,
+	// the client to turn it around, and the next request to arrive.
+	batchPollGapAllowance = 10 * time.Second
 )
 
 // Client-side defaults. See Connector.
@@ -184,6 +190,12 @@ type ConnectRequest struct {
 	// Servers echo it only when resume is enabled for this session. Keeping it
 	// separate protects older resumable clients that only understand streams.
 	BatchResume bool `json:"batch_resume,omitempty"`
+	// PollIntervalMS is the client's idle pause between batch polls
+	// (Connector.PollInterval). A resumable pure-batch session has no request
+	// attached between polls, so the server uses this to avoid counting a
+	// healthy session against ServerConfig.MaxDetachedResumable. Clamped to the
+	// resume grace; ignored for every other transport.
+	PollIntervalMS int64 `json:"poll_interval_ms,omitempty"`
 }
 
 // ResumeRequest is the JSON body of POST {prefix}/{id}/resume, sent by a

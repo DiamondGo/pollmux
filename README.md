@@ -27,9 +27,9 @@ All handlers for a deployment should share one store, configuration, and hook se
 
 | Method | Path | Handler |
 |---|---|---|
-| POST | `/tunnel/connect` | [`ConnectHandler()`](handler.go#L288) |
-| POST | `/tunnel/{id}/poll` | [`PollHandler()`](handler.go#L422), for both HTTP directions |
-| DELETE | `/tunnel/{id}` | [`DeleteHandler()`](handler.go#L836) |
+| POST | `/tunnel/connect` | [`ConnectHandler()`](handler.go#L291) |
+| POST | `/tunnel/{id}/poll` | [`PollHandler()`](handler.go#L434), for both HTTP directions |
+| DELETE | `/tunnel/{id}` | [`DeleteHandler()`](handler.go#L848) |
 | GET | `/tunnel/{id}/ws` | [`WebSocketHandler()`](websocket.go#L62), when WebSocket is offered |
 | POST | `/tunnel/{id}/resume` | [`ResumeHandler()`](resume_server.go#L208), when resume is offered |
 
@@ -129,7 +129,7 @@ The configured [`MaxStreamWindowSize`](yamux.go#L27) is 256 KiB, yamux's **minim
 
 The flow-control buffering budget is roughly window size × concurrent streams: **256 KiB × 256 streams ≈ 64 MiB per tunnel**, multiplied by the number of tunnels in a multi-tenant deployment. This is not a hard bound on total process memory: pipes, replay buffers, HTTP bodies, and application state add overhead. [`BufferedPipe`](pipe.go#L23) itself has no backpressure; normal yamux flow control is what bounds ordinary stream traffic. Applications writing arbitrary bytes directly to a connection cannot assume the same protection.
 
-Limit concurrent streams rather than trying to shrink the window below yamux's floor. Use [`BufferedPipe.HiWater()`](pipe.go#L65), [`Session.HiWater()`](session.go#L299), and [`ServerConfig.HighWaterWarn`](handler.go#L65) to observe actual buffering.
+Limit concurrent streams rather than trying to shrink the window below yamux's floor. Use [`BufferedPipe.HiWater()`](pipe.go#L65), [`Session.HiWater()`](session.go#L328), and [`ServerConfig.HighWaterWarn`](handler.go#L65) to observe actual buffering.
 
 ## Transport behavior and caveats
 
@@ -212,7 +212,7 @@ Resume requires all of the following:
 3. [`ResumeHandler()`](resume_server.go#L208) is mounted at `POST /{prefix}/{id}/resume` behind the **same authentication middleware as poll, DELETE, and WebSocket**.
 4. The connect response actually negotiates `resumable: true`.
 
-The API switches remain the same: the client requests `prefer_resume` and the server responds with `resumable`. New clients automatically send [`ConnectRequest.BatchResume`](protocol.go#L186), wire field `batch_resume`, when requesting resume. This capability **does not enable resume on its own**. New servers echo [`ConnectResponse.BatchResume`](protocol.go#L309) only for resumable sessions when the client advertised it.
+The API switches remain the same: the client requests `prefer_resume` and the server responds with `resumable`. New clients automatically send [`ConnectRequest.BatchResume`](protocol.go#L192), wire field `batch_resume`, when requesting resume. This capability **does not enable resume on its own**. New servers echo [`ConnectResponse.BatchResume`](protocol.go#L321) only for resumable sessions when the client advertised it.
 
 | Negotiated transport | With batch-resume capability | Without batch-resume capability |
 |---|---|---|
@@ -228,13 +228,13 @@ Every resumable entry still requires both resume switches. This additive capabil
 
 Without resume, transport loss ends the virtual connection, and a reconnect creates a new session ID and a new yamux session. Existing application streams cannot survive that replacement.
 
-With resume, a reliable byte layer sits below yamux. Each direction has absolute byte offsets, cumulative acknowledgments, and a replay buffer. Bytes remain retained until the peer acknowledges receiving them; a successful local HTTP write alone is not an acknowledgment. Stream/WebSocket transports carry numbered data and ACK frames, with ACKs sent alongside reverse traffic/heartbeats and an eager ACK wakeup at half a yamux window.
+With resume, a reliable byte layer sits below yamux. Each direction has absolute byte offsets, cumulative acknowledgments, and a replay buffer. Bytes remain retained until the peer acknowledges receiving them; a successful local HTTP write alone is not an acknowledgment. Stream/WebSocket transports carry numbered data and ACK frames, with ACKs sent alongside reverse traffic/heartbeats and an eager ACK wakeup at half a yamux window. Batch requests and responses carry the cumulative ACK in headers every time, so a direction whose ACKs travel that way skips the eager wakeup and never issues ACK-only requests.
 
 On transport failure, the client stops both directions, then sends `POST /{prefix}/{id}/resume` with its protocol version and `recv_offset`: the number of downstream bytes received contiguously. The server first cancels and waits out old attachments, then answers with its contiguous upstream `recv_offset`. Each side replays from the other side's offset before sending new bytes. Duplicate or overlapping replay is discarded; gaps and impossible acknowledgments are rejected rather than corrupting yamux's byte stream. Only one transport owns each direction at a time, including during a resume handshake.
 
 **The session ID, server session, and yamux session stay the same.** A successful recovery is internal to the connection and does not close its transport-failed signal. Reads can block through the outage. Transport-level writes queue locally without waiting for the network, avoiding yamux's connection write timeout during recovery, but **application/yamux stream writes can still block on flow control** once their window is exhausted. Application contexts, stream deadlines, and business timeouts still apply; resume does not suspend or extend them. This is ordered byte-stream recovery, not a guarantee that an application has processed or committed a business operation.
 
-During a valid detached grace period, the server does not evict the session using ordinary idle timeout. [`CloseSessionIfNoPollInFlight()`](handler.go#L888) also treats it as busy, so a reaper using that helper need not learn a separate resume policy. Applications can inspect [`Session.Resumable()`](session.go#L122) and [`Session.ResumeDeadline()`](session.go#L132) for monitoring. Explicit session close, DELETE, and shutdown still terminate it; resume never resurrects a deliberately closed session. Once the grace has run out, any late attach (poll, upload, WebSocket, or resume) gets 410 even if the sweeper has not evicted the session yet, so the recovery window is exactly `resume_grace_ms`.
+During a valid detached grace period, the server does not evict the session using ordinary idle timeout. [`CloseSessionIfNoPollInFlight()`](handler.go#L900) also treats it as busy, so a reaper using that helper need not learn a separate resume policy. Applications can inspect [`Session.Resumable()`](session.go#L127) and [`Session.ResumeDeadline()`](session.go#L137) for monitoring. Explicit session close, DELETE, and shutdown still terminate it; resume never resurrects a deliberately closed session. Once the grace has run out, any late attach (poll, upload, WebSocket, or resume) gets 410 even if the sweeper has not evicted the session yet, so the recovery window is exactly `resume_grace_ms`.
 
 ### Resumable batch wire behavior
 
@@ -263,9 +263,9 @@ Pure-batch resumable sessions must have [`Connector.PollInterval`](client.go#L86
 |---|---|
 | [`ServerConfig.ResumeGrace`](handler.go#L119) | 30 seconds detached; hard maximum 5 minutes; configuration above the maximum panics |
 | [`MaxReplayBytes`](handler.go#L126) on the server and [`Connector.MaxReplayBytes`](client.go#L155) on the client | 16 MiB per outgoing direction; independently configured, not negotiated |
-| [`ServerConfig.MaxDetachedResumable`](handler.go#L133) | 1,024 detached resumable sessions; the sweeper evicts longest-detached first; negative disables the cap |
+| [`ServerConfig.MaxDetachedResumable`](handler.go#L136) | 1,024 detached resumable sessions; the sweeper evicts longest-detached first; negative disables the cap. A pure-batch session counts only after it has been detached longer than the client's declared `poll_interval_ms` (clamped to the grace) plus 10 seconds, because a healthy one has nothing attached between polls |
 
-Start the configured [`StartSweeper()`](handler.go#L902) to enforce grace expiry and the detached-session cap. A detached session retains application state and replay memory, so grace and population limits are important memory controls, not just retry tuning. The replay limit covers retained, transmitted-but-unacknowledged bytes, not all queued data or total session memory. Normal yamux windowing helps bound pending traffic per active stream, but concurrency still matters.
+Start the configured [`StartSweeper()`](handler.go#L914) to enforce grace expiry and the detached-session cap. A detached session retains application state and replay memory, so grace and population limits are important memory controls, not just retry tuning. The replay limit covers retained, transmitted-but-unacknowledged bytes, not all queued data or total session memory. Normal yamux windowing helps bound pending traffic per active stream, but concurrency still matters.
 
 Recovery ends and the client signals transport failure for a fresh-session reconnect when, for example:
 
@@ -281,7 +281,7 @@ Sessions and replay buffers are **process-local and not persistent**. A server r
 
 ### Authentication boundary
 
-[`Hooks.Authenticate`](handler.go#L249) authenticates **connect requests only**. It is not called by poll, DELETE, WebSocket, or resume handlers. Session IDs are random 128-bit values, but the application must still apply the same credential and session-authorization policy to **all** those routes. The client's bearer token is sent on subsequent requests as well.
+[`Hooks.Authenticate`](handler.go#L252) authenticates **connect requests only**. It is not called by poll, DELETE, WebSocket, or resume handlers. Session IDs are random 128-bit values, but the application must still apply the same credential and session-authorization policy to **all** those routes. The client's bearer token is sent on subsequent requests as well.
 
 A caller reaching resume with an out-of-range `recv_offset` permanently invalidates that session's resumability and gets 409. This is intentional: letting an inconsistent peer guess offsets until one happens to fit could silently replay the wrong bytes. An authorized caller capable of this could also DELETE the session outright; that security argument only holds if no endpoint bypasses the common middleware. Never expose resume unprotected just because connect has an authentication hook.
 
@@ -330,7 +330,7 @@ The upgrade has its own error surface: 404 for an unknown session, 400 for a ses
 
 ## Authoritative parameter negotiation
 
-The server sends [`Limits`](protocol.go#L215) at connect time: `max_send_bytes`, `poll_timeout_ms`, `session_timeout_ms`, and `poll_buffer_bytes`; streaming in either direction or WebSocket additionally supplies `heartbeat_interval_ms` and `stream_max_duration_ms`. Resumable sessions also receive `resume_grace_ms`. WebSocket ignores stream duration even though it is included.
+The server sends [`Limits`](protocol.go#L227) at connect time: `max_send_bytes`, `poll_timeout_ms`, `session_timeout_ms`, and `poll_buffer_bytes`; streaming in either direction or WebSocket additionally supplies `heartbeat_interval_ms` and `stream_max_duration_ms`. Resumable sessions also receive `resume_grace_ms`. WebSocket ignores stream duration even though it is included.
 
 **Configure shared transport limits on the server, not independently at both ends.** Clients validate the response and can only choose more conservative behavior, such as a smaller upload chunk. The server's negotiated modes and limits are authoritative; requests do not override a session's negotiated direction later.
 

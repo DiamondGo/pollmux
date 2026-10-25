@@ -142,7 +142,9 @@ func (st *SessionStore) removeAndMarkClosed(s *Session, requireIdle bool) bool {
 // detached, measured against its own resumeGrace rather than timeout — a
 // resumable session that lost its transport is exactly the case the grace
 // exists for. Beyond that, maxDetachedResumable bounds how many such
-// sessions may wait at once; the longest-detached are evicted first.
+// sessions may wait at once; the longest-detached are evicted first. A
+// pure-batch session is only counted once it has been detached longer than
+// its normal gap between polls, so healthy clients are never the excess.
 func (st *SessionStore) sweep(timeout time.Duration, onEvict func(*Session)) {
 	now := time.Now()
 	var expired []*Session
@@ -158,7 +160,7 @@ func (st *SessionStore) sweep(timeout time.Duration, onEvict func(*Session)) {
 					s.closed = true
 					delete(st.sessions, id)
 					expired = append(expired, s)
-				} else {
+				} else if s.detachedBeyondPollGapLocked(now) {
 					detached = append(detached, s)
 				}
 			case now.Sub(s.lastActive) > timeout:
@@ -177,7 +179,7 @@ func (st *SessionStore) sweep(timeout time.Duration, onEvict func(*Session)) {
 		sort.Slice(detached, func(i, j int) bool { return detached[i].detachedAt.Before(detached[j].detachedAt) })
 		for _, s := range detached[:len(detached)-max] {
 			s.mu.Lock()
-			if !s.closed && s.pollInFlight == 0 {
+			if !s.closed && s.detachedBeyondPollGapLocked(now) {
 				s.closed = true
 				delete(st.sessions, s.ID)
 				expired = append(expired, s)
