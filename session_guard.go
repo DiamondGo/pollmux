@@ -59,5 +59,5 @@ func isSessionClosedErr(err error) bool {
 		return true
 	}
 	var f *fatalPollError
-	return errors.As(err, &f) && f.status == http.StatusGone
+	return errors.As(err, &f) && (f.status == http.StatusGone || f.status == http.StatusNotFound)
 }

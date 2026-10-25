@@ -37,6 +37,10 @@ type Session struct {
 	// so PollHandler can read it with no lock, the same way it already
 	// treats meta as effectively immutable post-construction.
 	pollMode string
+	// uploadStream and batchResume are negotiated once, before publication.
+	// They keep legacy raw batch bodies out of the reliable byte stream.
+	uploadStream bool
+	batchResume  bool
 
 	// transport is "" or TransportWebSocket, set once by ConnectHandler
 	// alongside pollMode and likewise never mutated after. WebSocketHandler

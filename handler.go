@@ -103,9 +103,9 @@ type ServerConfig struct {
 	// EnableResume lets ConnectHandler negotiate a resumable session for a
 	// client that sends PreferResume: the session and the yamux session on
 	// top of it survive the transport breaking, as long as the client
-	// resumes (see ResumeHandler) within ResumeGrace. Only WebSocket
-	// transport and stream mode in both directions can be resumed; a batch
-	// negotiation ignores this. A client that does not ask, or a server
+	// resumes (see ResumeHandler) within ResumeGrace. WebSocket, stream and
+	// batch transports are supported; batch requires the client's BatchResume
+	// capability. A client that does not ask, or a server
 	// with this left false, is completely unaffected. Mount ResumeHandler
 	// when turning this on.
 	EnableResume bool
@@ -347,6 +347,7 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 
 		s := newSession(id, meta)
 		s.pollMode = negotiatedMode
+		s.uploadStream = negotiatedUpload == PollModeStream
 		s.watchHighWater(cfg.HighWaterWarn, cfg.Logger)
 
 		// Decided here, before the session is published, because
@@ -360,6 +361,7 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 		resumable := negotiateResume(cfg, req, transport, negotiatedMode, negotiatedUpload)
 		if resumable {
 			s.enableResume(cfg.MaxReplayBytes, cfg.ResumeGrace)
+			s.batchResume = req.BatchResume
 		}
 
 		// Register before the callback. The client's first poll can beat
@@ -406,6 +408,7 @@ func ConnectHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 			UploadStreamMode: uploadStreamMode,
 			Transport:        transport,
 			Resumable:        resumable,
+			BatchResume:      resumable && req.BatchResume,
 		})
 	})
 }
@@ -442,21 +445,28 @@ func PollHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 		}
 
 		if r.Header.Get(HeaderSendStream) == "true" {
+			if s.rs != nil && (s.transport == TransportWebSocket || !s.uploadStream) {
+				writeError(w, http.StatusBadRequest, "session did not negotiate streamed uploads")
+				return
+			}
 			pollSendStream(w, r, s, cfg)
 			return
 		}
 
 		if s.rs != nil {
-			// A resumable session only ever negotiated stream mode in both
-			// directions (or WebSocket, which never comes through here), so
-			// the only other request shape it accepts is a receive-only
-			// stream poll. A discrete send would bypass the reliable layer's
-			// numbering and corrupt the upstream offsets.
-			if r.Header.Get(HeaderReceiveOnly) != "true" || r.Header.Get(HeaderSendOnly) == "true" {
-				writeError(w, http.StatusBadRequest, "resumable session accepts only stream requests")
+			send := r.Header.Get(HeaderSendOnly) == "true"
+			receive := r.Header.Get(HeaderReceiveOnly) == "true"
+			if s.transport == TransportWebSocket || send == receive {
+				writeError(w, http.StatusBadRequest, "resumable HTTP session requires exactly one direction")
 				return
 			}
-			pollStream(w, r, s, cfg)
+			if receive && s.pollMode == PollModeStream {
+				pollStream(w, r, s, cfg)
+			} else if s.batchResume && (!send || !s.uploadStream) {
+				pollBatchResumable(w, r, s, st, cfg, h, send)
+			} else {
+				writeError(w, http.StatusBadRequest, "session did not negotiate this batch direction")
+			}
 			return
 		}
 

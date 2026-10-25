@@ -76,6 +76,11 @@ func (a *attachments) attach(kind attachKind, kick func()) (*attachment, error) 
 	for _, k := range kinds {
 		for {
 			a.mu.Lock()
+			if a.resuming {
+				a.mu.Unlock()
+				a.detach(att)
+				return nil, errStillAttached
+			}
 			slot := a.slot(k)
 			old := *slot
 			if old == nil {
@@ -271,10 +276,9 @@ func ResumeHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler {
 }
 
 // negotiateResume decides whether a session is made resumable: the server
-// must enable it, the client must ask, and the negotiated transport must be
-// one the reliable layer covers — WebSocket, or stream mode in both
-// directions. Batch mode is left out on purpose: one response per message
-// gives the seam nothing to replay into.
+// must enable it and the client must ask. Older resumable clients only know
+// WebSocket and two-way streams; batch/mixed HTTP needs the additional
+// BatchResume capability to avoid upgrading such clients to an unknown wire format.
 func negotiateResume(cfg ServerConfig, req ConnectRequest, transport, pollMode, uploadMode string) bool {
 	if !cfg.EnableResume || !req.PreferResume {
 		return false
@@ -282,5 +286,5 @@ func negotiateResume(cfg ServerConfig, req ConnectRequest, transport, pollMode, 
 	if transport == TransportWebSocket {
 		return true
 	}
-	return pollMode == PollModeStream && uploadMode == PollModeStream
+	return req.BatchResume || (pollMode == PollModeStream && uploadMode == PollModeStream)
 }
