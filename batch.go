@@ -32,6 +32,17 @@ func setBatchOffset(h http.Header, name string, off uint64) {
 	h.Set(name, strconv.FormatUint(off, 10))
 }
 
+// bodyIsEmpty reports whether a body of unknown length (chunked, or an HTTP/2
+// request without content-length) carries no bytes. The deadline is cleared
+// before returning: a parked poll must not inherit it, or the server's
+// background read would cancel the request once it expired.
+func bodyIsEmpty(rc *http.ResponseController, body io.Reader) bool {
+	rc.SetReadDeadline(time.Now().Add(defaultStreamReadGrace))
+	defer rc.SetReadDeadline(time.Time{})
+	n, err := io.Copy(io.Discard, io.LimitReader(body, 1))
+	return n == 0 && err == nil
+}
+
 // pollBatchResumable owns exactly one direction until the request finishes.
 // ResumeHandler can cancel even a parked poll or a half-read upload before
 // examining offsets. Incomplete uploads never enter the reliable byte stream.
@@ -41,6 +52,12 @@ func pollBatchResumable(w http.ResponseWriter, r *http.Request, s *Session, st *
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	rc := http.NewResponseController(w)
+	defer rc.SetReadDeadline(time.Time{})
+	defer rc.SetWriteDeadline(time.Time{})
+
 	var off uint64
 	if send {
 		off, err = batchOffset(r.Header, HeaderSendOffset)
@@ -48,16 +65,10 @@ func pollBatchResumable(w http.ResponseWriter, r *http.Request, s *Session, st *
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-	} else if r.ContentLength != 0 {
+	} else if r.ContentLength != 0 && !bodyIsEmpty(rc, r.Body) {
 		writeError(w, http.StatusBadRequest, "receive-only batch must have an empty body")
 		return
 	}
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	rc := http.NewResponseController(w)
-	defer rc.SetReadDeadline(time.Time{})
-	defer rc.SetWriteDeadline(time.Time{})
 	kind := attachDown
 	if send {
 		kind = attachUp
@@ -116,6 +127,9 @@ func pollBatchResumable(w http.ResponseWriter, r *http.Request, s *Session, st *
 		return
 	}
 
+	// A batch client polls serially, so its ack is exactly where this response
+	// must start. Anything past it went out in a response the client never got.
+	s.rs.rewindToAcked()
 	buf := make([]byte, cfg.PollBufferSize)
 	off, n, err := s.rs.nextOut(buf, cfg.PollTimeout, cfg.CoalesceWindow)
 	if ctx.Err() != nil {
@@ -189,6 +203,11 @@ func (c *resumableConn) doBatchPoll(ctx context.Context) (bool, error) {
 	}
 	if len(data) > c.maxFrame {
 		return false, errors.New("pollmux: batch response exceeds poll_buffer_bytes")
+	}
+	// An idle poll is 204; an empty 200 is malformed and, with no PollInterval,
+	// would otherwise be re-polled in a tight loop.
+	if resp.StatusCode == http.StatusOK && len(data) == 0 {
+		return false, errors.New("pollmux: batch response is 200 with an empty body")
 	}
 	ack, err := batchOffset(resp.Header, HeaderRecvOffset)
 	if err != nil {

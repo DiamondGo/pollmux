@@ -1622,3 +1622,35 @@ func TestRelayStreamDiesOnKillWithoutResume(t *testing.T) {
 		t.Fatal("consumer reused the dead session id")
 	}
 }
+
+// Grace is enforced at attach time, not only by the sweeper: a session past it
+// must not be revived by a request that beats the next sweep.
+func TestResumeExpiredGraceRefusesLateAttach(t *testing.T) {
+	expire := func(s *Session) {
+		s.mu.Lock()
+		s.detachedAt = time.Now().Add(-2 * s.resumeGrace)
+		s.mu.Unlock()
+	}
+	ts, st := newResumeTestServer(t, testResumeServerConfig(), Hooks{})
+
+	cr := connectResumableBatch(t, ts)
+	s, _ := st.Get(cr.SessionID)
+	expire(s)
+	if resp, _ := postResume(t, ts, cr.SessionID, ResumeRequest{ProtocolVersion: ProtocolVersion}); resp.StatusCode != http.StatusGone {
+		t.Fatalf("resume after grace = %d, want 410", resp.StatusCode)
+	}
+	if resp, _ := rawBatch(t, ts, cr.SessionID, false, 0, 0, nil); resp.StatusCode != http.StatusGone {
+		t.Fatalf("poll after grace = %d, want 410", resp.StatusCode)
+	}
+	if s.PollInFlight() != 0 {
+		t.Fatal("refused attach left the session marked active")
+	}
+
+	_, wcr := postConnect(t, ts, ConnectRequest{ProtocolVersion: ProtocolVersion, PreferWebSocket: true, PreferResume: true})
+	ws, _ := st.Get(wcr.SessionID)
+	expire(ws)
+	_, resp, err := websocket.Dial(context.Background(), ts.URL+"/tunnel/"+wcr.SessionID+"/ws", nil)
+	if err == nil || resp == nil || resp.StatusCode != http.StatusGone {
+		t.Fatalf("websocket after grace = (%v, %v), want 410", resp, err)
+	}
+}

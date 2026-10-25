@@ -1,6 +1,7 @@
 package pollmux
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -127,6 +128,74 @@ func TestBatchResumeDownstreamReplaysOnlyMissingBytes(t *testing.T) {
 	requireBatchOffset(t, resp, HeaderRecvOffset, 0)
 	if s.rs.unacked() != 0 {
 		t.Fatal("next poll did not release acknowledged replay")
+	}
+}
+
+// A poll whose response never reached the client (a stale request delivered
+// late, say) is not followed by a handshake; the next poll's ack alone must be
+// enough to resend what was lost.
+func TestBatchResumePollRestartsAtItsAcknowledgement(t *testing.T) {
+	cfg := testResumeServerConfig()
+	cfg.PollBufferSize = 5
+	ts, st := newResumeTestServer(t, cfg, Hooks{})
+	cr := connectResumableBatch(t, ts)
+	s, _ := st.Get(cr.SessionID)
+	s.Write([]byte("abcdefghij"))
+	if _, data := rawBatch(t, ts, cr.SessionID, false, 0, 0, nil); string(data) != "abcde" {
+		t.Fatalf("lost batch = %q", data)
+	}
+	resp, data := rawBatch(t, ts, cr.SessionID, false, 0, 0, nil)
+	if string(data) != "abcde" {
+		t.Fatalf("poll after lost response = %q, want the lost bytes again", data)
+	}
+	requireBatchOffset(t, resp, HeaderSendOffset, 0)
+	resp, data = rawBatch(t, ts, cr.SessionID, false, 0, 5, nil)
+	if string(data) != "fghij" {
+		t.Fatalf("next batch = %q", data)
+	}
+	requireBatchOffset(t, resp, HeaderSendOffset, 5)
+	// A stale ack cannot rewind below what the client already confirmed.
+	resp, data = rawBatch(t, ts, cr.SessionID, false, 0, 0, nil)
+	if string(data) != "fghij" {
+		t.Fatalf("poll with stale ack = %q", data)
+	}
+	requireBatchOffset(t, resp, HeaderSendOffset, 5)
+	if !s.Resumable() {
+		t.Fatal("stale ack broke resumability")
+	}
+}
+
+// Proxies may re-frame an empty POST as chunked; only actual bytes make a
+// receive-only poll malformed.
+func TestBatchResumeChunkedReceiveOnlyPoll(t *testing.T) {
+	ts, st := newResumeTestServer(t, testResumeServerConfig(), Hooks{})
+	cr := connectResumableBatch(t, ts)
+	s, _ := st.Get(cr.SessionID)
+	s.Write([]byte("down"))
+	for _, tc := range []struct {
+		chunks string
+		want   int
+	}{{"0\r\n\r\n", http.StatusOK}, {"3\r\nabc\r\n0\r\n\r\n", http.StatusBadRequest}} {
+		conn, err := net.DialTimeout("tcp", strings.TrimPrefix(ts.URL, "http://"), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Fprintf(conn, "POST /tunnel/%s/poll HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n%s: true\r\n%s: 0\r\n\r\n%s",
+			cr.SessionID, HeaderReceiveOnly, HeaderRecvOffset, tc.chunks); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(resp.Body)
+		conn.Close()
+		if resp.StatusCode != tc.want {
+			t.Fatalf("chunked poll %q = %d, want %d", tc.chunks, resp.StatusCode, tc.want)
+		}
+		if tc.want == http.StatusOK && string(data) != "down" {
+			t.Fatalf("chunked poll data = %q", data)
+		}
 	}
 }
 
@@ -283,6 +352,7 @@ func TestBatchResumeClientValidatesResponses(t *testing.T) {
 		{"gap", 200, map[string]string{HeaderRecvOffset: "0", HeaderSendOffset: "1"}, "abc"},
 		{"bad ack", 204, map[string]string{HeaderRecvOffset: "1"}, ""},
 		{"oversized", 200, map[string]string{HeaderRecvOffset: "0", HeaderSendOffset: "0"}, "123456789"},
+		{"empty data", 200, map[string]string{HeaderRecvOffset: "0", HeaderSendOffset: "0"}, ""},
 		{"truncated", 200, map[string]string{HeaderRecvOffset: "0", HeaderSendOffset: "0", "Content-Length": "8"}, "abc"},
 		{"closed", 410, nil, ""},
 	} {
@@ -700,7 +770,12 @@ func TestBatchResumeConcurrentStreams(t *testing.T) {
 		}
 	}
 	close(start)
-	for i := 0; i < 3; i++ {
+	// A kill can land between finite batch requests and break nothing, so keep
+	// going until one demonstrably forced a resume.
+	for i := 0; i < 3 || e.resumes.Load() == 0; i++ {
+		if i == 300 {
+			t.Fatal("no transport kill forced a resume")
+		}
 		e.proxy.killAll()
 		time.Sleep(15 * time.Millisecond)
 	}
@@ -715,7 +790,8 @@ func TestBatchResumeConcurrentStreams(t *testing.T) {
 		}
 	}
 	if conn.SessionID() != id || sess.IsClosed() || isClosed(conn.TransportFailed()) || e.resumes.Load() == 0 {
-		t.Fatal("concurrent streams did not retain their session")
+		t.Fatalf("concurrent streams did not retain their session: id changed=%v yamux closed=%v transport failed=%v resumes=%d",
+			conn.SessionID() != id, sess.IsClosed(), isClosed(conn.TransportFailed()), e.resumes.Load())
 	}
 }
 

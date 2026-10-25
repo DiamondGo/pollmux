@@ -148,6 +148,14 @@ func (s *Session) inResumeGraceLocked(now time.Time) bool {
 		now.Sub(s.detachedAt) <= s.resumeGrace
 }
 
+// resumeExpiredLocked reports whether s is a detached resumable session whose
+// grace has run out but which the sweeper has not evicted yet. Such a session
+// must not be revived by a late attach. s.mu must be held.
+func (s *Session) resumeExpiredLocked(now time.Time) bool {
+	return s.rs != nil && s.pollInFlight == 0 && !s.rs.isBroken() &&
+		now.Sub(s.detachedAt) > s.resumeGrace
+}
+
 // watchHighWater arms the high-water warning on both pipes.
 func (s *Session) watchHighWater(threshold int, logger *slog.Logger) {
 	if threshold <= 0 || logger == nil {
@@ -205,11 +213,11 @@ func (s *Session) closePipes() {
 }
 
 // beginPoll atomically attaches a poll or persistent transport unless the
-// session has already been closed.
+// session has already been closed or its resume grace has expired.
 func (s *Session) beginPoll() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || s.resumeExpiredLocked(time.Now()) {
 		return false
 	}
 	s.pollInFlight++
@@ -234,7 +242,7 @@ func (s *Session) noteDetachedLocked() {
 func (s *Session) beginWebSocket() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.wsAttached {
+	if s.closed || s.wsAttached || s.resumeExpiredLocked(time.Now()) {
 		return false
 	}
 	s.wsAttached = true
@@ -253,6 +261,14 @@ func (s *Session) endWebSocket() {
 // writeUpstream queues data the client sent for the application to read.
 func (s *Session) writeUpstream(p []byte) (int, error) {
 	return s.toServer.Write(p)
+}
+
+// refusesAttach reports whether every future attach will be refused: the
+// session is closed, or it is resumable and its grace expired while detached.
+func (s *Session) refusesAttach() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed || s.resumeExpiredLocked(time.Now())
 }
 
 // IsClosed reports whether Close has been called.

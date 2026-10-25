@@ -215,6 +215,20 @@ func (r *reliable) resumeOut(peerRecv uint64) bool {
 	return true
 }
 
+// rewindToAcked makes the next nextOut resend everything the peer has not
+// acknowledged. Only valid for a direction whose transport carries at most one
+// response at a time and opens each request with a cumulative ack (batch
+// polls): there, anything sent but not acked was lost along with its response,
+// even when no resume handshake follows, as with a stale request that attached
+// late and answered a peer no longer listening.
+func (r *reliable) rewindToAcked() {
+	r.mu.Lock()
+	if !r.broken {
+		r.sentCursor = r.ackedOffset
+	}
+	r.mu.Unlock()
+}
+
 // recvOffsetNow is what this end reports in a resume handshake.
 func (r *reliable) recvOffsetNow() uint64 {
 	r.mu.Lock()

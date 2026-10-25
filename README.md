@@ -234,7 +234,7 @@ On transport failure, the client stops both directions, then sends `POST /{prefi
 
 **The session ID, server session, and yamux session stay the same.** A successful recovery is internal to the connection and does not close its transport-failed signal. Reads can block through the outage. Transport-level writes queue locally without waiting for the network, avoiding yamux's connection write timeout during recovery, but **application/yamux stream writes can still block on flow control** once their window is exhausted. Application contexts, stream deadlines, and business timeouts still apply; resume does not suspend or extend them. This is ordered byte-stream recovery, not a guarantee that an application has processed or committed a business operation.
 
-During a valid detached grace period, the server does not evict the session using ordinary idle timeout. [`CloseSessionIfNoPollInFlight()`](handler.go#L888) also treats it as busy, so a reaper using that helper need not learn a separate resume policy. Applications can inspect [`Session.Resumable()`](session.go#L122) and [`Session.ResumeDeadline()`](session.go#L132) for monitoring. Explicit session close, DELETE, and shutdown still terminate it; resume never resurrects a deliberately closed session.
+During a valid detached grace period, the server does not evict the session using ordinary idle timeout. [`CloseSessionIfNoPollInFlight()`](handler.go#L888) also treats it as busy, so a reaper using that helper need not learn a separate resume policy. Applications can inspect [`Session.Resumable()`](session.go#L122) and [`Session.ResumeDeadline()`](session.go#L132) for monitoring. Explicit session close, DELETE, and shutdown still terminate it; resume never resurrects a deliberately closed session. Once the grace has run out, any late attach (poll, upload, WebSocket, or resume) gets 410 even if the sweeper has not evicted the session yet, so the recovery window is exactly `resume_grace_ms`.
 
 ### Resumable batch wire behavior
 
@@ -243,8 +243,8 @@ Resumable batches are **raw, bounded, finite HTTP bodies**, not framed streams h
 | Message | Required offset headers |
 |---|---|
 | Send-only batch request | `X-Send-Offset`: absolute starting upload byte offset; `X-Recv-Offset`: cumulative downstream acknowledgment |
-| Receive-only batch request, with an empty body | `X-Recv-Offset`: cumulative downstream acknowledgment |
-| 200 batch poll response | `X-Send-Offset`: absolute starting download byte offset; `X-Recv-Offset`: cumulative upstream acknowledgment |
+| Receive-only batch request, with an empty body (`Content-Length: 0` or an empty chunked body) | `X-Recv-Offset`: cumulative downstream acknowledgment |
+| 200 batch poll response, always with a non-empty body | `X-Send-Offset`: absolute starting download byte offset; `X-Recv-Offset`: cumulative upstream acknowledgment |
 | Successful batch upload response or 204 idle poll response | `X-Recv-Offset`: cumulative upstream acknowledgment |
 
 Offsets are unsigned decimal byte counts, present even when zero. Each required header must have exactly one value; missing, malformed, duplicated, or ambiguous values are rejected. Every batch request and successful batch response carries the cumulative receive acknowledgment, **including 204**. Mixed HTTP sessions use these headers on the batch direction and numbered frames/ACKs on the streaming direction.
@@ -252,6 +252,8 @@ Offsets are unsigned decimal byte counts, present even when zero. Each required 
 The server reads an entire upload successfully before accepting its data into the reliable byte stream. An incomplete upload is not partially delivered. The client likewise consumes and validates a complete bounded poll body before delivery; an explicit response length detects truncation. Upload success responses must have an empty body and be consumed successfully before their acknowledgment is accepted.
 
 If an upload was accepted but its 200 response was lost, or a download was truncated after leaving the server queue, the sender still retains the unacknowledged bytes. The client performs the resume handshake **before retransmitting**, and the absolute offsets prevent duplicate delivery while replaying whatever is missing. A raw batch retry without the handshake is not the client's recovery algorithm.
+
+Batch downloads are strictly serial, so the server also starts every poll response at that poll's cumulative acknowledgment. A response lost without any handshake, such as a stale poll that a proxy delivered after the client had already resumed, is therefore resent by the next poll instead of leaving a gap. An idle poll is answered with 204; the client rejects a 200 with an empty body as malformed.
 
 Pure-batch resumable sessions must have [`Connector.PollInterval`](client.go#L86) **strictly below the negotiated resume grace**; connect rejects an interval reaching that grace. Between finite requests there may be no attachment, so a healthy client must poll again before its detached session expires. The default zero interval is recommended.
 

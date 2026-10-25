@@ -115,7 +115,7 @@ func WebSocketHandler(st *SessionStore, cfg ServerConfig, h Hooks) http.Handler 
 		}
 
 		if !s.beginWebSocket() {
-			if s.IsClosed() {
+			if s.refusesAttach() {
 				writeError(w, http.StatusGone, "session closed")
 			} else {
 				writeError(w, http.StatusConflict, "session already has a websocket attached")
